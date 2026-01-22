@@ -190,8 +190,8 @@ class OCRProcessor:
             
             # Convert PDF to images (one image per page) with higher DPI for better quality
             logger.info(f"Converting PDF to images: {pdf_path}")
-            # Use higher DPI (300) for better OCR quality
-            images = convert_from_path(pdf_path, dpi=300, fmt='png')
+            # Use optimal DPI (250) for better quality with 1GB RAM
+            images = convert_from_path(pdf_path, dpi=250, fmt='png')
             
             logger.info(f"PDF has {len(images)} pages")
             
@@ -199,7 +199,7 @@ class OCRProcessor:
             for page_num, image in enumerate(images, start=1):
                 # Save temporary image
                 temp_image_path = pdf_path.replace('.pdf', f'_page_{page_num}.png')
-                image.save(temp_image_path, 'PNG', quality=95)
+                image.save(temp_image_path, 'PNG', quality=85, optimize=True)
                 
                 # Extract text using OCR
                 text = self.extract_text_from_image(temp_image_path)
