@@ -25,8 +25,9 @@ if LIBS['CV2_AVAILABLE']:
     import cv2
     import numpy as np
 
-if LIBS['EASYOCR_AVAILABLE']:
-    import easyocr
+# Commented out EasyOCR for lighter deployment
+# if LIBS['EASYOCR_AVAILABLE']:
+#     import easyocr
 
 class OCRProcessor:
     """OCR processor for extracting text from images and PDFs"""
@@ -35,15 +36,15 @@ class OCRProcessor:
         """Initialize OCR processor"""
         self.easyocr_reader = None
         
-        # Initialize EasyOCR reader if available (better for Vietnamese)
-        if LIBS['EASYOCR_AVAILABLE']:
-            try:
-                # Initialize with Vietnamese and English
-                self.easyocr_reader = easyocr.Reader(['vi', 'en'], gpu=False)
-                logger.info("✅ EasyOCR initialized (Vietnamese + English)")
-            except Exception as e:
-                logger.warning(f"⚠️ Failed to initialize EasyOCR: {e}. Will use pytesseract.")
-                self.easyocr_reader = None
+        # Skip EasyOCR for lighter deployment - use only pytesseract
+        # if LIBS['EASYOCR_AVAILABLE']:
+        #     try:
+        #         # Initialize with Vietnamese and English
+        #         self.easyocr_reader = easyocr.Reader(['vi', 'en'], gpu=False)
+        #         logger.info("✅ EasyOCR initialized (Vietnamese + English)")
+        #     except Exception as e:
+        #         logger.warning(f"⚠️ Failed to initialize EasyOCR: {e}. Will use pytesseract.")
+        #         self.easyocr_reader = None
         
         logger.info("OCR processor initialized")
     
