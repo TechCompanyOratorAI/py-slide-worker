@@ -1,5 +1,6 @@
 tesseract-ocr
 tesseract-ocr-vie
 poppler-utils
-libgl1-mesa-glx
 libglib2.0-0
+libgl1-mesa-dev
+libglib2.0-dev
