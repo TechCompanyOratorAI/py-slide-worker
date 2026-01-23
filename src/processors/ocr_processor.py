@@ -117,10 +117,10 @@ class OCRProcessor:
         except Exception as e:
             logger.warning(f"Could not check file size: {e}")
         
-         # Check memory before processing (reduced requirement)
-         if not is_memory_available(100):  # Reduced to 100MB for OCR
-             logger.error("Insufficient memory for OCR processing")
-             return None
+        # Check memory before processing (reduced requirement)
+        if not is_memory_available(100):  # Reduced to 100MB for OCR
+            logger.error("Insufficient memory for OCR processing")
+            return None
         
         try:
             # Monitor memory during processing
@@ -171,10 +171,10 @@ class OCRProcessor:
             best_text = None
             for i, config in enumerate(configs):
                 try:
-                     # Check memory before each attempt (reduced requirement)
-                     if not is_memory_available(30):
-                         logger.warning(f"Skipping OCR config {i+1} due to low memory")
-                         break
+                    # Check memory before each attempt (reduced requirement)
+                    if not is_memory_available(30):
+                        logger.warning(f"Skipping OCR config {i+1} due to low memory")
+                        break
                     
                     # Set timeout for OCR operation (30 seconds max)
                     def timeout_handler(signum, frame):
