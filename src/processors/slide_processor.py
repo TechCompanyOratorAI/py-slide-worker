@@ -164,20 +164,21 @@ class SlideProcessor:
     
     def process_slide(self, slide_url: str, slide_id: int) -> Dict:
         """
-        Process a single slide: download, OCR (handle PDF multi-page), generate embedding
+        Process a single slide: download, smart text extraction, per-slide embeddings
         
         Args:
             slide_url: URL of slide file (PDF, image, etc.)
             slide_id: Slide ID
             
         Returns:
-            Dictionary with processing results including pages data
+            Dictionary with processing results optimized for slide-speech alignment
         """
         result = {
             'success': False,
-            'extractedText': None,  # Combined text from all pages
-            'pages': None,  # List of {pageNumber, text} for multi-page files
-            'embedding': None,
+            'extractedText': None,  # Combined text (for backward compatibility)
+            'slides': None,  # List of {slideIndex, text, embedding} for alignment
+            'pages': None,  # Raw page data (for debugging)
+            'totalSlides': 0,
             'error': None
         }
         
@@ -206,42 +207,18 @@ class SlideProcessor:
             # Check if it's a PDF file
             is_pdf = file_ext == '.pdf' or slide_path.lower().endswith('.pdf')
             
-            if is_pdf and LIBS['PDF2IMAGE_AVAILABLE']:
-                # Process PDF: extract text from each page
-                logger.info(f"Processing PDF file: {slide_path}")
-                pages_data = self.ocr_processor.process_pdf_to_pages(slide_path)
-                
-                if pages_data:
-                    # Combine all text with Vietnamese format
-                    combined_text = '\n\n'.join([f"[Trang {p['pageNumber']}]\n{p['text']}" for p in pages_data])
-                    
-                    result['extractedText'] = combined_text
-                    result['pages'] = pages_data
-                    result['success'] = True
-                    
-                    logger.info(f"✅ Processed {len(pages_data)} pages from PDF")
-                else:
-                    result['error'] = 'No text extracted from PDF'
+            if is_pdf:
+                # Process PDF with smart text-first extraction
+                logger.info(f"Processing PDF file with smart extraction: {slide_path}")
+                result = self._process_pdf_smart(slide_path, result)
             else:
-                # Process as single image
-                logger.info(f"Processing image file: {slide_path}")
-                extracted_text = self.ocr_processor.extract_text_from_image(slide_path)
-                
-                if extracted_text:
-                    result['extractedText'] = extracted_text
-                    result['pages'] = [{
-                        'pageNumber': 1,
-                        'text': extracted_text
-                    }]
-                    result['success'] = True
-                else:
-                    result['error'] = 'OCR extraction failed'
+                # Process as single image/slide
+                logger.info(f"Processing single slide: {slide_path}")
+                result = self._process_single_slide(slide_path, result)
             
-            # Generate embedding if we have text
-            if result['success'] and result['extractedText']:
-                embedding = self.generate_embedding(result['extractedText'])
-                if embedding:
-                    result['embedding'] = embedding
+            # Generate per-slide embeddings for alignment
+            if result['success'] and result['slides']:
+                result = self._generate_per_slide_embeddings(result)
             
             # Cleanup enhanced image if created (for single image files)
             if not is_pdf:
@@ -268,6 +245,155 @@ class SlideProcessor:
             
             # Force memory cleanup
             optimize_memory()
+        
+        return result
+    
+    def _process_pdf_smart(self, pdf_path: str, result: Dict) -> Dict:
+        """
+        Process PDF with smart text-first extraction + OCR fallback
+        
+        Args:
+            pdf_path: Path to PDF file
+            result: Result dictionary to update
+            
+        Returns:
+            Updated result dictionary
+        """
+        try:
+            # Import PDF text extractor
+            from .pdf_text_extractor import get_pdf_text_extractor
+            pdf_extractor = get_pdf_text_extractor(self.ocr_processor)
+            
+            # Smart extraction with OCR fallback
+            pages_data = pdf_extractor.smart_extract_with_ocr_fallback(pdf_path)
+            
+            if not pages_data:
+                result['error'] = 'Failed to extract text from PDF'
+                return result
+            
+            # Convert pages to slides format (for alignment)
+            slides_data = []
+            all_text_parts = []
+            
+            for page_data in pages_data:
+                slide_text = page_data['text'].strip()
+                
+                # Create slide entry for alignment
+                slide_entry = {
+                    'slideIndex': page_data['pageNumber'],  # 1-based index
+                    'text': slide_text,
+                    'extractionMethod': page_data['extractionMethod'],
+                    'confidence': page_data['confidence'],
+                    'embedding': None  # Will be filled later
+                }
+                slides_data.append(slide_entry)
+                
+                # For combined text (backward compatibility)
+                if slide_text:
+                    all_text_parts.append(f"[Slide {page_data['pageNumber']}]\n{slide_text}")
+            
+            # Update result
+            result['slides'] = slides_data
+            result['pages'] = pages_data  # Raw page data for debugging
+            result['totalSlides'] = len(slides_data)
+            result['extractedText'] = '\n\n'.join(all_text_parts)  # Combined for compatibility
+            result['success'] = True
+            
+            logger.info(f"✅ Smart PDF processing: {len(slides_data)} slides extracted")
+            
+        except Exception as e:
+            logger.error(f"Smart PDF processing failed: {e}")
+            result['error'] = f'Smart PDF processing failed: {str(e)}'
+        
+        return result
+    
+    def _process_single_slide(self, slide_path: str, result: Dict) -> Dict:
+        """
+        Process single image/slide file
+        
+        Args:
+            slide_path: Path to slide file
+            result: Result dictionary to update
+            
+        Returns:
+            Updated result dictionary
+        """
+        try:
+            # OCR single image
+            extracted_text = self.ocr_processor.extract_text_from_image(slide_path)
+            
+            if extracted_text:
+                # Create single slide entry
+                slide_entry = {
+                    'slideIndex': 1,
+                    'text': extracted_text.strip(),
+                    'extractionMethod': 'ocr',
+                    'confidence': 'medium',
+                    'embedding': None  # Will be filled later
+                }
+                
+                result['slides'] = [slide_entry]
+                result['pages'] = [{
+                    'pageNumber': 1,
+                    'text': extracted_text,
+                    'extractionMethod': 'ocr',
+                    'confidence': 'medium'
+                }]
+                result['totalSlides'] = 1
+                result['extractedText'] = extracted_text  # Single slide text
+                result['success'] = True
+                
+                logger.info(f"✅ Single slide processed: {len(extracted_text)} characters")
+            else:
+                result['error'] = 'OCR extraction failed for single slide'
+                
+        except Exception as e:
+            logger.error(f"Single slide processing failed: {e}")
+            result['error'] = f'Single slide processing failed: {str(e)}'
+        
+        return result
+    
+    def _generate_per_slide_embeddings(self, result: Dict) -> Dict:
+        """
+        Generate embeddings for each slide individually (for alignment)
+        
+        Args:
+            result: Result dictionary with slides data
+            
+        Returns:
+            Updated result with per-slide embeddings
+        """
+        try:
+            if not result.get('slides'):
+                return result
+            
+            slides_with_embeddings = []
+            
+            for slide_data in result['slides']:
+                slide_text = slide_data['text'].strip()
+                
+                if slide_text:
+                    # Generate embedding for this specific slide
+                    embedding = self.generate_embedding(slide_text)
+                    slide_data['embedding'] = embedding
+                    
+                    if embedding:
+                        logger.debug(f"Generated embedding for slide {slide_data['slideIndex']}: {len(embedding)} dimensions")
+                else:
+                    slide_data['embedding'] = None
+                    logger.debug(f"No text for slide {slide_data['slideIndex']}, no embedding generated")
+                
+                slides_with_embeddings.append(slide_data)
+            
+            result['slides'] = slides_with_embeddings
+            
+            # Count successful embeddings
+            embedded_slides = sum(1 for s in slides_with_embeddings if s['embedding'] is not None)
+            logger.info(f"✅ Generated embeddings for {embedded_slides}/{len(slides_with_embeddings)} slides")
+            
+        except Exception as e:
+            logger.error(f"Per-slide embedding generation failed: {e}")
+            # Don't fail the whole process, just log the error
         
         return result
 

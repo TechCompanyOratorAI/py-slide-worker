@@ -16,7 +16,9 @@ psutil>=5.9.0,<6.0.0
 # Image processing (lightweight)
 Pillow>=10.0.0,<11.0.0
 
-# PDF processing
+# PDF processing - text-first approach
+PyMuPDF>=1.23.0,<2.0.0
+pdfplumber>=0.10.0,<1.0.0
 pdf2image>=1.16.3,<2.0.0
 
 # OCR - only pytesseract (lighter than easyocr)

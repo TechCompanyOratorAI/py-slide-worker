@@ -55,7 +55,9 @@ def check_library_availability():
         'OCR_AVAILABLE': False,
         'PDF2IMAGE_AVAILABLE': False,
         'CV2_AVAILABLE': False,
-        'EASYOCR_AVAILABLE': False
+        'EASYOCR_AVAILABLE': False,
+        'PYMUPDF_AVAILABLE': False,
+        'PDFPLUMBER_AVAILABLE': False
     }
     
     logger = logging.getLogger(__name__)
@@ -86,5 +88,17 @@ def check_library_availability():
         availability['EASYOCR_AVAILABLE'] = True
     except ImportError:
         logger.info("ℹ️ easyocr not installed. Will use pytesseract only.")
+    
+    try:
+        import fitz  # PyMuPDF
+        availability['PYMUPDF_AVAILABLE'] = True
+    except ImportError:
+        logger.info("ℹ️ PyMuPDF not installed. Text-first PDF extraction will be limited.")
+    
+    try:
+        import pdfplumber
+        availability['PDFPLUMBER_AVAILABLE'] = True
+    except ImportError:
+        logger.info("ℹ️ pdfplumber not installed. Advanced PDF text extraction will be limited.")
     
     return availability
