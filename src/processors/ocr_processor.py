@@ -5,8 +5,11 @@ Handles text extraction from images and PDFs using pytesseract and easyocr
 
 import os
 import logging
+import signal
+import time
 from typing import Optional, List, Dict
 from config.config import OCR_LANGUAGE, check_library_availability
+from config.memory_config import check_memory_usage, is_memory_available, optimize_memory, MAX_IMAGE_SIZE
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +96,7 @@ class OCRProcessor:
     
     def extract_text_from_image(self, image_path: str) -> Optional[str]:
         """
-        Extract text from single image using OCR
+        Extract text from single image using OCR with memory management
         
         Args:
             image_path: Path to image file
@@ -105,7 +108,23 @@ class OCRProcessor:
             logger.error("OCR libraries not available. Please install pytesseract and Pillow.")
             return None
         
+        # Check file size
         try:
+            file_size = os.path.getsize(image_path)
+            if file_size > MAX_IMAGE_SIZE:
+                logger.error(f"Image too large: {file_size} bytes > {MAX_IMAGE_SIZE} bytes limit")
+                return None
+        except Exception as e:
+            logger.warning(f"Could not check file size: {e}")
+        
+        # Check memory before processing
+        if not is_memory_available(200):  # Need ~200MB for OCR
+            logger.error("Insufficient memory for OCR processing")
+            return None
+        
+        try:
+            # Monitor memory during processing
+            check_memory_usage()
             # Enhance image for better OCR
             enhanced_path = self.enhance_image(image_path)
             
@@ -142,7 +161,7 @@ class OCRProcessor:
             # PSM 11: Sparse text (for slides with scattered text)
             # Try PSM 6 first, then 11 if needed
             
-            # Try different PSM modes for better results
+            # Try different PSM modes for better results with timeout
             configs = [
                 f'--psm 6 -l {OCR_LANGUAGE}',  # Uniform block
                 f'--psm 11 -l {OCR_LANGUAGE}',  # Sparse text
@@ -150,15 +169,38 @@ class OCRProcessor:
             ]
             
             best_text = None
-            for config in configs:
+            for i, config in enumerate(configs):
                 try:
-                    text = pytesseract.image_to_string(image, config=config)
-                    text = ' '.join(text.split())  # Clean up whitespace
+                    # Check memory before each attempt
+                    if not is_memory_available(50):
+                        logger.warning(f"Skipping OCR config {i+1} due to low memory")
+                        break
                     
-                    if text.strip() and (best_text is None or len(text) > len(best_text)):
-                        best_text = text
-                except:
+                    # Set timeout for OCR operation (30 seconds max)
+                    def timeout_handler(signum, frame):
+                        raise TimeoutError("OCR operation timed out")
+                    
+                    signal.signal(signal.SIGALRM, timeout_handler)
+                    signal.alarm(30)  # 30 second timeout
+                    
+                    try:
+                        text = pytesseract.image_to_string(image, config=config)
+                        text = ' '.join(text.split())  # Clean up whitespace
+                        
+                        if text.strip() and (best_text is None or len(text) > len(best_text)):
+                            best_text = text
+                    finally:
+                        signal.alarm(0)  # Cancel timeout
+                        
+                except TimeoutError:
+                    logger.warning(f"OCR config {i+1} timed out, trying next...")
                     continue
+                except Exception as e:
+                    logger.warning(f"OCR config {i+1} failed: {e}")
+                    continue
+                finally:
+                    # Force cleanup after each attempt
+                    optimize_memory()
             
             if best_text and best_text.strip():
                 logger.info(f"Pytesseract extracted {len(best_text)} characters")
@@ -167,13 +209,21 @@ class OCRProcessor:
                 logger.warning("Pytesseract returned empty text")
                 return None
                 
+        except MemoryError as e:
+            logger.error(f"OCR failed due to memory exhaustion for {image_path}: {e}")
+            optimize_memory()
+            return None
         except Exception as e:
             logger.error(f"OCR failed for {image_path}: {e}", exc_info=True)
+            optimize_memory()
             return None
+        finally:
+            # Always cleanup memory after OCR
+            optimize_memory()
     
     def process_pdf_to_pages(self, pdf_path: str) -> List[Dict]:
         """
-        Process PDF file: convert each page to image and extract text
+        Process PDF file: convert each page to image and extract text with memory management
         
         Args:
             pdf_path: Path to PDF file
@@ -185,48 +235,82 @@ class OCRProcessor:
             logger.error("PDF processing libraries not available")
             return []
         
+        # Check memory before starting
+        if not is_memory_available(300):  # Need ~300MB for PDF processing
+            logger.error("Insufficient memory for PDF processing")
+            return []
+        
         try:
             pages_data = []
             
-            # Convert PDF to images (one image per page) with higher DPI for better quality
+            # Convert PDF to images with memory-optimized settings
             logger.info(f"Converting PDF to images: {pdf_path}")
-            # Use optimal DPI (250) for better quality with 1GB RAM
-            images = convert_from_path(pdf_path, dpi=250, fmt='png')
+            from config.memory_config import DPI_SETTING, MAX_PDF_PAGES
+            
+            # Use memory-optimized DPI
+            images = convert_from_path(pdf_path, dpi=DPI_SETTING, fmt='png', 
+                                    first_page=1, last_page=MAX_PDF_PAGES)
             
             logger.info(f"PDF has {len(images)} pages")
             
-            # Process each page
+            # Process each page with memory monitoring
             for page_num, image in enumerate(images, start=1):
-                # Save temporary image
-                temp_image_path = pdf_path.replace('.pdf', f'_page_{page_num}.png')
-                image.save(temp_image_path, 'PNG', quality=85, optimize=True)
-                
-                # Extract text using OCR
-                text = self.extract_text_from_image(temp_image_path)
-                
-                if text:
-                    pages_data.append({
-                        'pageNumber': page_num,
-                        'text': text
-                    })
-                    logger.info(f"Page {page_num}: Extracted {len(text)} characters")
-                else:
-                    logger.warning(f"Page {page_num}: No text extracted")
-                
-                # Cleanup temp image and enhanced image if exists
                 try:
-                    os.remove(temp_image_path)
-                    enhanced_path = temp_image_path.replace('.png', '_enhanced.png')
-                    if os.path.exists(enhanced_path):
-                        os.remove(enhanced_path)
+                    # Check memory before processing each page
+                    if not is_memory_available(100):
+                        logger.warning(f"Stopping PDF processing at page {page_num} due to low memory")
+                        break
+                    
+                    # Save temporary image
+                    temp_image_path = pdf_path.replace('.pdf', f'_page_{page_num}.png')
+                    image.save(temp_image_path, 'PNG', quality=85, optimize=True)
+                    
+                    # Clear the image from memory immediately
+                    del image
+                    optimize_memory()
+                    
+                    # Extract text using OCR
+                    text = self.extract_text_from_image(temp_image_path)
+                    
+                    if text:
+                        pages_data.append({
+                            'pageNumber': page_num,
+                            'text': text
+                        })
+                        logger.info(f"Page {page_num}: Extracted {len(text)} characters")
+                    else:
+                        logger.warning(f"Page {page_num}: No text extracted")
+                    
                 except Exception as e:
-                    logger.debug(f"Failed to cleanup temp files: {e}")
+                    logger.error(f"Error processing page {page_num}: {e}")
+                    
+                finally:
+                    # Cleanup temp image and enhanced image if exists
+                    try:
+                        if 'temp_image_path' in locals():
+                            if os.path.exists(temp_image_path):
+                                os.remove(temp_image_path)
+                            enhanced_path = temp_image_path.replace('.png', '_enhanced.png')
+                            if os.path.exists(enhanced_path):
+                                os.remove(enhanced_path)
+                    except Exception as e:
+                        logger.debug(f"Failed to cleanup temp files: {e}")
+                    
+                    # Force memory cleanup after each page
+                    optimize_memory()
             
             return pages_data
             
+        except MemoryError as e:
+            logger.error(f"PDF processing failed due to memory exhaustion: {e}")
+            optimize_memory()
+            return pages_data  # Return partial results
         except Exception as e:
             logger.error(f"PDF processing failed: {e}", exc_info=True)
-            return []
+            return pages_data  # Return partial results if any
+        finally:
+            # Final memory cleanup
+            optimize_memory()
     
     def cleanup_enhanced_image(self, original_path: str):
         """Clean up enhanced image file if it exists"""

@@ -1,24 +1,33 @@
-# Requirements file for py-analysis-worker
+# Production requirements for py-analysis-worker (optimized for 1GB RAM)
 
 # AWS SDK
-boto3>=1.28.0
+boto3>=1.28.0,<2.0.0
+botocore>=1.31.0,<2.0.0
+
+# Environment and configuration
+python-dotenv>=1.0.0,<2.0.0
 
 # HTTP requests
-requests>=2.31.0
+requests>=2.31.0,<3.0.0
 
-# Utilities
-python-dotenv>=1.0.0
+# System monitoring
+psutil>=5.9.0,<6.0.0
 
-# OCR libraries
-pytesseract>=0.3.10
-Pillow>=10.0.0  # Required for pytesseract
-pdf2image>=1.16.3  # Convert PDF to images
-easyocr>=1.7.0  # Better OCR for Vietnamese, can be used as alternative
+# Image processing (lightweight)
+Pillow>=10.0.0,<11.0.0
 
-# Image processing and enhancement
-opencv-python>=4.8.0
-numpy>=1.24.0  # Required for opencv and image processing
+# PDF processing
+pdf2image>=1.16.3,<2.0.0
 
-# Embedding generation (uncomment when needed)
-# sentence-transformers>=2.2.0
-# torch>=2.0.0  # Required for sentence-transformers
+# OCR - only pytesseract (lighter than easyocr)
+pytesseract>=0.3.10,<1.0.0
+
+# Basic image processing (headless version for containers)
+opencv-python-headless>=4.8.0,<5.0.0
+numpy>=1.24.0,<2.0.0
+
+# Text processing (for future embedding support)
+scikit-learn>=1.3.0,<2.0.0
+
+# Logging and utilities
+python-dateutil>=2.8.0,<3.0.0
