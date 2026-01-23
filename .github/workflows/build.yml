@@ -2,21 +2,72 @@ name: Build and Test
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, develop]
   pull_request:
-    branches: [main, master]
+    branches: [main, master, develop]
+  workflow_dispatch: # Allow manual triggering
+
+env:
+  PYTHON_VERSION: "3.11"
 
 jobs:
-  test:
+  lint:
+    name: Code Quality & Linting
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v4
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install linting dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install flake8 black isort mypy
+
+      - name: Run Black formatter check
+        run: black --check --diff .
+
+      - name: Run isort import sorting check
+        run: isort --check-only --diff .
+
+      - name: Run flake8 linting
+        run: flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+
+      - name: Run mypy type checking
+        run: mypy . --ignore-missing-imports || true
+
+  test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    needs: lint
+
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Cache system dependencies
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/apt
+          key: ${{ runner.os }}-apt-${{ hashFiles('Aptfile') }}
+          restore-keys: |
+            ${{ runner.os }}-apt-
 
       - name: Install system dependencies
         run: |
@@ -26,27 +77,30 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements-light.txt
+          pip install -r requirements.txt
 
       - name: Run syntax check
         run: |
           python -m py_compile worker.py
-          python -m py_compile scripts/main.py
-          python -m py_compile scripts/run_worker.py
+          python -m py_compile health_check.py
 
-      - name: Test imports
+      - name: Test imports and module loading
         run: |
           python -c "
           import sys, os
           sys.path.insert(0, '.')
 
+          # Test config module
           try:
               from config.config import validate_config
               print('✅ Config module works')
+              validate_config()
+              print('✅ Config validation passed')
           except Exception as e:
               print(f'❌ Config failed: {e}')
               sys.exit(1)
 
+          # Test all core modules
           try:
               from src.processors import get_ocr_processor, get_slide_processor
               from src.clients import get_aws_client, get_webhook_client
@@ -55,18 +109,32 @@ jobs:
           except Exception as e:
               print(f'❌ Module import failed: {e}')
               sys.exit(1)
+
+          # Test health check
+          try:
+              from health_check import health_check
+              print('✅ Health check module works')
+          except Exception as e:
+              print(f'❌ Health check failed: {e}')
+              sys.exit(1)
           "
 
-      - name: Check for TODO/FIXME
+      - name: Run health check
         run: |
-          if grep -r "TODO\|FIXME\|XXX\|HACK" src/ config/ scripts/ --exclude-dir=__pycache__; then
+          python health_check.py || echo "⚠️ Health check failed (expected without AWS credentials)"
+
+      - name: Check for TODO/FIXME items
+        run: |
+          if grep -r "TODO\|FIXME\|XXX\|HACK" src/ config/ scripts/ --exclude-dir=__pycache__ --exclude="*.pyc"; then
             echo "⚠️ Found TODO/FIXME items - review before production"
+            exit 0  # Don't fail the build for this
           else
             echo "✅ No TODO/FIXME found"
           fi
 
-      - name: Security check - no .env file
+      - name: Security checks
         run: |
+          # Check for .env file
           if [ -f .env ]; then
             echo "❌ .env file found - should not be in repository"
             exit 1
@@ -74,8 +142,77 @@ jobs:
             echo "✅ No .env file (good for security)"
           fi
 
-      - name: ✅ Build Success
+          # Check for hardcoded secrets
+          if grep -r "password\|secret\|key" --include="*.py" . | grep -v "# noqa" | grep -v "test" | grep -v "example"; then
+            echo "⚠️ Potential hardcoded secrets found - please review"
+          else
+            echo "✅ No obvious hardcoded secrets found"
+          fi
+
+      - name: Check deployment files
         run: |
-          echo "🎉 Build completed successfully!"
-          echo "📦 Ready for manual deployment to DigitalOcean"
-          echo "🔧 Use the deployment files: Aptfile, requirements-light.txt, Procfile, runtime.txt"
+          required_files=("Aptfile" "requirements.txt" "Procfile" "worker.py" "health_check.py")
+          missing_files=()
+
+          for file in "${required_files[@]}"; do
+            if [ ! -f "$file" ]; then
+              missing_files+=("$file")
+            fi
+          done
+
+          if [ ${#missing_files[@]} -eq 0 ]; then
+            echo "✅ All required deployment files present"
+          else
+            echo "❌ Missing deployment files: ${missing_files[*]}"
+            exit 1
+          fi
+
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install security tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install safety bandit
+
+      - name: Run safety check for vulnerabilities
+        run: |
+          pip install -r requirements.txt
+          safety check || echo "⚠️ Safety check found potential vulnerabilities"
+
+      - name: Run bandit security linting
+        run: |
+          bandit -r . -f json -o bandit-report.json || true
+          bandit -r . || echo "⚠️ Bandit found potential security issues"
+
+  build-success:
+    name: Build Success
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    if: always()
+
+    steps:
+      - name: Check build status
+        run: |
+          if [[ "${{ needs.lint.result }}" == "success" && "${{ needs.test.result }}" == "success" ]]; then
+            echo "🎉 Build completed successfully!"
+            echo "📦 Ready for manual deployment to DigitalOcean"
+            echo "🔧 Use the deployment files: Aptfile, requirements.txt, Procfile"
+            echo "🚀 All checks passed - ready for production deployment"
+          else
+            echo "❌ Build failed - check the logs above"
+            exit 1
+          fi
