@@ -8,12 +8,14 @@ import tempfile
 import shutil
 import logging
 import requests
+import atexit
 from typing import Dict, Optional, List
 from urllib.parse import urlparse
 
 from src.clients.aws_client import get_aws_client
 from src.processors.ocr_processor import get_ocr_processor
 from config.config import check_library_availability
+from config.memory_config import check_memory_usage, is_memory_available, optimize_memory
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +29,10 @@ class SlideProcessor:
         """Initialize slide processor"""
         self.aws_client = get_aws_client()
         self.ocr_processor = get_ocr_processor()
+        self.temp_directories = []  # Track temp directories for cleanup
+        
+        # Register cleanup function
+        atexit.register(self.cleanup_all_temp_dirs)
         logger.info("Slide processor initialized")
     
     def download_slide(self, slide_url: str, local_path: str) -> bool:
@@ -145,6 +151,17 @@ class SlideProcessor:
         
         return file_ext
     
+    def cleanup_all_temp_dirs(self):
+        """Cleanup all temporary directories"""
+        for temp_dir in self.temp_directories[:]:  # Copy list to avoid modification during iteration
+            try:
+                if os.path.exists(temp_dir):
+                    shutil.rmtree(temp_dir)
+                    logger.debug(f"Cleaned up temp directory: {temp_dir}")
+                self.temp_directories.remove(temp_dir)
+            except Exception as e:
+                logger.warning(f"Failed to cleanup temp directory {temp_dir}: {e}")
+    
     def process_slide(self, slide_url: str, slide_id: int) -> Dict:
         """
         Process a single slide: download, OCR (handle PDF multi-page), generate embedding
@@ -164,14 +181,23 @@ class SlideProcessor:
             'error': None
         }
         
+        # Check memory before starting
+        if not is_memory_available(150):  # Need ~150MB for slide processing
+            logger.error("Insufficient memory for slide processing")
+            result['error'] = 'Insufficient memory'
+            return result
+        
         # Create temporary directory
         temp_dir = tempfile.mkdtemp(prefix=f'slide_{slide_id}_')
+        self.temp_directories.append(temp_dir)  # Track for cleanup
         
         # Determine file extension
         file_ext = self._determine_file_extension(slide_url)
         slide_path = os.path.join(temp_dir, f'slide_{slide_id}{file_ext}')
         
         try:
+            # Monitor memory usage
+            check_memory_usage()
             # Download slide
             if not self.download_slide(slide_url, slide_path):
                 result['error'] = 'Failed to download slide'
@@ -221,6 +247,10 @@ class SlideProcessor:
             if not is_pdf:
                 self.ocr_processor.cleanup_enhanced_image(slide_path)
             
+        except MemoryError as e:
+            logger.error(f"Slide processing failed due to memory exhaustion: {e}")
+            result['error'] = f'Memory exhaustion: {str(e)}'
+            optimize_memory()
         except Exception as e:
             logger.error(f"Error processing slide {slide_id}: {e}", exc_info=True)
             result['error'] = str(e)
@@ -228,9 +258,16 @@ class SlideProcessor:
         finally:
             # Cleanup temporary files
             try:
-                shutil.rmtree(temp_dir)
+                if temp_dir in self.temp_directories:
+                    self.temp_directories.remove(temp_dir)
+                if os.path.exists(temp_dir):
+                    shutil.rmtree(temp_dir)
+                    logger.debug(f"Cleaned up temp directory: {temp_dir}")
             except Exception as e:
                 logger.warning(f"Failed to cleanup temp directory {temp_dir}: {e}")
+            
+            # Force memory cleanup
+            optimize_memory()
         
         return result
 
