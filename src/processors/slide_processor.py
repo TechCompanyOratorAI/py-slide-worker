@@ -204,10 +204,15 @@ class SlideProcessor:
                 result['error'] = 'Failed to download slide'
                 return result
             
-            # Check if it's a PDF file
+            # Determine file type
             is_pdf = file_ext == '.pdf' or slide_path.lower().endswith('.pdf')
-            
-            if is_pdf:
+            is_pptx = file_ext in ('.pptx', '.ppt') or slide_path.lower().endswith(('.pptx', '.ppt'))
+
+            if is_pptx:
+                # Process PPTX with python-pptx direct text extraction
+                logger.info(f"Processing PPTX file: {slide_path}")
+                result = self._process_pptx(slide_path, result)
+            elif is_pdf:
                 # Process PDF with smart text-first extraction
                 logger.info(f"Processing PDF file with smart extraction: {slide_path}")
                 result = self._process_pdf_smart(slide_path, result)
@@ -221,7 +226,7 @@ class SlideProcessor:
                 result = self._generate_per_slide_embeddings(result)
             
             # Cleanup enhanced image if created (for single image files)
-            if not is_pdf:
+            if not is_pdf and not is_pptx:
                 self.ocr_processor.cleanup_enhanced_image(slide_path)
             
         except MemoryError as e:
@@ -307,6 +312,79 @@ class SlideProcessor:
         
         return result
     
+    def _process_pptx(self, pptx_path: str, result: Dict) -> Dict:
+        """
+        Process PPTX/PPT file using python-pptx direct text extraction
+
+        Args:
+            pptx_path: Path to PPTX/PPT file
+            result: Result dictionary to update
+
+        Returns:
+            Updated result dictionary
+        """
+        if not LIBS.get('PPTX_AVAILABLE'):
+            result['error'] = 'python-pptx not installed. Cannot process PPTX files.'
+            logger.error(result['error'])
+            return result
+
+        try:
+            from pptx import Presentation
+
+            prs = Presentation(pptx_path)
+            slides_data = []
+            all_text_parts = []
+
+            for slide_index, slide in enumerate(prs.slides, start=1):
+                text_parts = []
+                for shape in slide.shapes:
+                    if not shape.has_text_frame:
+                        continue
+                    for para in shape.text_frame.paragraphs:
+                        para_text = ''.join(run.text for run in para.runs).strip()
+                        if para_text:
+                            text_parts.append(para_text)
+
+                slide_text = '\n'.join(text_parts).strip()
+
+                slide_entry = {
+                    'slideIndex': slide_index,
+                    'text': slide_text,
+                    'extractionMethod': 'pptx_direct',
+                    'confidence': 'high',
+                    'embedding': None
+                }
+                slides_data.append(slide_entry)
+
+                if slide_text:
+                    all_text_parts.append(f"[Slide {slide_index}]\n{slide_text}")
+
+            if not slides_data:
+                result['error'] = 'No slides found in PPTX file'
+                return result
+
+            result['slides'] = slides_data
+            result['pages'] = [
+                {
+                    'pageNumber': s['slideIndex'],
+                    'text': s['text'],
+                    'extractionMethod': s['extractionMethod'],
+                    'confidence': s['confidence']
+                }
+                for s in slides_data
+            ]
+            result['totalSlides'] = len(slides_data)
+            result['extractedText'] = '\n\n'.join(all_text_parts)
+            result['success'] = True
+
+            logger.info(f"✅ PPTX processing: {len(slides_data)} slides extracted")
+
+        except Exception as e:
+            logger.error(f"PPTX processing failed: {e}", exc_info=True)
+            result['error'] = f'PPTX processing failed: {str(e)}'
+
+        return result
+
     def _process_single_slide(self, slide_path: str, result: Dict) -> Dict:
         """
         Process single image/slide file
