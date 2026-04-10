@@ -57,7 +57,8 @@ def check_library_availability():
         'CV2_AVAILABLE': False,
         'EASYOCR_AVAILABLE': False,
         'PYMUPDF_AVAILABLE': False,
-        'PDFPLUMBER_AVAILABLE': False
+        'PDFPLUMBER_AVAILABLE': False,
+        'PPTX_AVAILABLE': False
     }
     
     logger = logging.getLogger(__name__)
@@ -100,5 +101,11 @@ def check_library_availability():
         availability['PDFPLUMBER_AVAILABLE'] = True
     except ImportError:
         logger.info("ℹ️ pdfplumber not installed. Advanced PDF text extraction will be limited.")
-    
+
+    try:
+        from pptx import Presentation
+        availability['PPTX_AVAILABLE'] = True
+    except ImportError:
+        logger.warning("⚠️ python-pptx not installed. PPTX file processing will not work.")
+
     return availability
