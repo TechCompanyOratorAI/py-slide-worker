@@ -314,44 +314,94 @@ class SlideProcessor:
     
     def _process_pptx(self, pptx_path: str, result: Dict) -> Dict:
         """
-        Process PPTX/PPT file using python-pptx direct text extraction
-
-        Args:
-            pptx_path: Path to PPTX/PPT file
-            result: Result dictionary to update
-
-        Returns:
-            Updated result dictionary
+        Process PPTX/PPT file with two-pass strategy per slide:
+          1. Direct text extraction from text frames (fast, high confidence)
+          2. OCR fallback on embedded PICTURE shapes for image-heavy slides
         """
         if not LIBS.get('PPTX_AVAILABLE'):
             result['error'] = 'python-pptx not installed. Cannot process PPTX files.'
             logger.error(result['error'])
             return result
 
+        # PIL image formats that OCR can handle (skip EMF/WMF which PIL cannot open)
+        SUPPORTED_IMG_EXTS = {'png', 'jpg', 'jpeg', 'gif', 'bmp', 'tiff', 'tif'}
+        MIN_TEXT_CHARS = 20
+        temp_dir = os.path.dirname(pptx_path)
+
         try:
             from pptx import Presentation
+            from pptx.enum.shapes import MSO_SHAPE_TYPE
 
             prs = Presentation(pptx_path)
             slides_data = []
             all_text_parts = []
 
             for slide_index, slide in enumerate(prs.slides, start=1):
+
+                # --- Pass 1: text frames ---
                 text_parts = []
                 for shape in slide.shapes:
-                    if not shape.has_text_frame:
-                        continue
-                    for para in shape.text_frame.paragraphs:
-                        para_text = ''.join(run.text for run in para.runs).strip()
-                        if para_text:
-                            text_parts.append(para_text)
+                    if shape.has_text_frame:
+                        for para in shape.text_frame.paragraphs:
+                            para_text = ''.join(run.text for run in para.runs).strip()
+                            if para_text:
+                                text_parts.append(para_text)
 
                 slide_text = '\n'.join(text_parts).strip()
+                extraction_method = 'pptx_direct'
+                confidence = 'high'
+
+                # --- Pass 2: OCR fallback for image-heavy slides ---
+                if len(slide_text) < MIN_TEXT_CHARS and LIBS.get('OCR_AVAILABLE'):
+                    ocr_texts = []
+                    for shape in slide.shapes:
+                        if shape.shape_type != MSO_SHAPE_TYPE.PICTURE:
+                            continue
+
+                        temp_img_path = None
+                        try:
+                            img_ext = shape.image.ext.lower()
+                            if img_ext not in SUPPORTED_IMG_EXTS:
+                                logger.debug(f"Slide {slide_index}: skipping unsupported image format '{img_ext}'")
+                                continue
+
+                            temp_img_path = os.path.join(
+                                temp_dir,
+                                f'pptx_slide{slide_index}_shape{shape.shape_id}.{img_ext}'
+                            )
+                            with open(temp_img_path, 'wb') as f:
+                                f.write(shape.image.blob)
+
+                            ocr_text = self.ocr_processor.extract_text_from_image(temp_img_path)
+                            if ocr_text:
+                                ocr_texts.append(ocr_text.strip())
+                                logger.debug(f"Slide {slide_index} shape {shape.shape_id}: OCR {len(ocr_text)} chars")
+
+                        except Exception as e:
+                            logger.warning(f"Slide {slide_index}: OCR fallback error for shape: {e}")
+                        finally:
+                            if temp_img_path:
+                                try:
+                                    if os.path.exists(temp_img_path):
+                                        os.remove(temp_img_path)
+                                    self.ocr_processor.cleanup_enhanced_image(temp_img_path)
+                                except Exception:
+                                    pass
+
+                    if ocr_texts:
+                        ocr_combined = '\n'.join(ocr_texts)
+                        slide_text = (slide_text + '\n' + ocr_combined).strip() if slide_text else ocr_combined
+                        extraction_method = 'pptx_ocr_fallback'
+                        confidence = 'medium'
+                        logger.info(f"Slide {slide_index}: OCR fallback → {len(ocr_combined)} chars")
+                    else:
+                        logger.debug(f"Slide {slide_index}: no text and no extractable images")
 
                 slide_entry = {
                     'slideIndex': slide_index,
                     'text': slide_text,
-                    'extractionMethod': 'pptx_direct',
-                    'confidence': 'high',
+                    'extractionMethod': extraction_method,
+                    'confidence': confidence,
                     'embedding': None
                 }
                 slides_data.append(slide_entry)
@@ -377,7 +427,8 @@ class SlideProcessor:
             result['extractedText'] = '\n\n'.join(all_text_parts)
             result['success'] = True
 
-            logger.info(f"✅ PPTX processing: {len(slides_data)} slides extracted")
+            text_slides = sum(1 for s in slides_data if s['text'])
+            logger.info(f"✅ PPTX: {len(slides_data)} slides, {text_slides} with text")
 
         except Exception as e:
             logger.error(f"PPTX processing failed: {e}", exc_info=True)

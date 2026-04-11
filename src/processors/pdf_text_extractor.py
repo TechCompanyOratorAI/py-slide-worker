@@ -7,7 +7,7 @@ import os
 import logging
 from typing import List, Dict, Optional, Tuple
 from config.config import check_library_availability
-from config.memory_config import check_memory_usage, is_memory_available, optimize_memory
+from config.memory_config import check_memory_usage, is_memory_available, optimize_memory, DPI_SETTING
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +30,7 @@ class PDFTextExtractor:
     def __init__(self, ocr_processor=None):
         """Initialize PDF text extractor"""
         self.ocr_processor = ocr_processor
-        self.min_text_threshold = 50  # Minimum chars to consider page has text
+        self.min_text_threshold = 20  # Minimum chars to consider page has text
         logger.info("PDF text extractor initialized")
     
     def extract_text_pymupdf(self, pdf_path: str) -> List[Dict]:
@@ -196,64 +196,55 @@ class PDFTextExtractor:
             return []
         
         try:
-            # Convert only the pages that need OCR
             from pdf2image import convert_from_path
-            
-            # Get page numbers that need OCR (1-indexed)
+
             page_numbers = [p['pageNumber'] for p in ocr_pages]
-            
             logger.info(f"Converting pages {page_numbers} to images for OCR")
-            
-            # Convert specific pages only
-            images = convert_from_path(
-                pdf_path, 
-                dpi=150,  # Lower DPI for memory efficiency
-                fmt='png',
-                first_page=min(page_numbers),
-                last_page=max(page_numbers)
-            )
-            
+
             ocr_results = []
-            
-            for i, image in enumerate(images):
-                actual_page_num = min(page_numbers) + i
-                
-                if actual_page_num not in page_numbers:
-                    continue
-                
-                # Check memory before each OCR
+
+            for page_num in page_numbers:
+                # Check memory before each page
                 if not is_memory_available(100):
-                    logger.warning(f"Stopping OCR at page {actual_page_num} due to memory")
+                    logger.warning(f"Stopping OCR at page {page_num} due to memory")
                     break
-                
-                # Save temp image
-                temp_image_path = pdf_path.replace('.pdf', f'_ocr_page_{actual_page_num}.png')
-                image.save(temp_image_path, 'PNG', quality=85, optimize=True)
-                
-                # Clear image from memory
-                del image
+
+                # Convert only this single page
+                images = convert_from_path(
+                    pdf_path,
+                    dpi=DPI_SETTING,
+                    fmt='png',
+                    first_page=page_num,
+                    last_page=page_num
+                )
+
+                if not images:
+                    logger.warning(f"No image generated for page {page_num}")
+                    continue
+
+                temp_image_path = pdf_path.replace('.pdf', f'_ocr_page_{page_num}.png')
+                images[0].save(temp_image_path, 'PNG', quality=85, optimize=True)
+                del images
                 optimize_memory()
-                
-                # OCR the page
+
                 text = self.ocr_processor.extract_text_from_image(temp_image_path)
-                
+
                 ocr_results.append({
-                    'pageNumber': actual_page_num,
+                    'pageNumber': page_num,
                     'text': text or ''
                 })
-                
-                # Cleanup temp file
+
                 try:
                     os.remove(temp_image_path)
-                    # Also remove enhanced image if exists
-                    enhanced_path = temp_image_path.replace('.png', '_enhanced.png')
+                    base, ext = os.path.splitext(temp_image_path)
+                    enhanced_path = f"{base}_enhanced{ext}"
                     if os.path.exists(enhanced_path):
                         os.remove(enhanced_path)
                 except Exception as e:
                     logger.debug(f"Failed to cleanup OCR temp files: {e}")
-                
-                logger.info(f"OCR page {actual_page_num}: {len(text or '')} characters extracted")
-            
+
+                logger.info(f"OCR page {page_num}: {len(text or '')} characters extracted")
+
             return ocr_results
             
         except Exception as e:

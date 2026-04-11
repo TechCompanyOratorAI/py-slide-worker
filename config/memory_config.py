@@ -13,12 +13,12 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# Memory limits for 1GB RAM instance (hardcoded for stability)
-MAX_PDF_PAGES = 30  # Fixed at 30 pages as requested
-MAX_IMAGE_SIZE = 10485760  # 10MB max image size
-DPI_SETTING = 150  # Fixed DPI for OCR processing
-MEMORY_LIMIT_MB = 800  # 800MB memory limit (80% of 1GB)
-MEMORY_WARNING_MB = 600  # Warning threshold at 600MB
+# Memory limits for 2GB RAM instance
+MAX_PDF_PAGES = 50  # Increased from 30 with more RAM headroom
+MAX_IMAGE_SIZE = 20971520  # 20MB max image size (doubled from 10MB)
+DPI_SETTING = 300  # DPI for OCR processing (300 is optimal for tesseract accuracy)
+MEMORY_LIMIT_MB = 1600  # 1600MB memory limit (80% of 2GB)
+MEMORY_WARNING_MB = 1200  # Warning threshold at 1200MB
 
 def optimize_memory():
     """Force garbage collection to free memory"""
