@@ -22,7 +22,9 @@ from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config.config import validate_config, SQS_QUEUE_URL
-from config.memory_config import check_memory_usage, optimize_memory, is_memory_available
+from config.memory_config import (
+    check_memory_usage, optimize_memory, is_memory_available, get_available_memory_mb
+)
 from src.clients.aws_client import get_aws_client
 from src.handlers.message_handler import get_message_handler
 
@@ -101,11 +103,21 @@ def poll_queue():
                     time.sleep(0.1)
                     continue
 
-                # --- Memory guard: ~300MB headroom per pending job ---
-                if not is_memory_available(300 * available):
-                    logger.warning("⚠️ Low memory, waiting before fetching more messages")
+                # --- Memory guard: ~300MB headroom per job ---
+                # Calculate how many jobs we can actually afford right now
+                # instead of blocking if we can't afford ALL available slots.
+                MEMORY_PER_JOB_MB = 300
+                headroom_mb = get_available_memory_mb()
+                affordable = min(available, max(0, int(headroom_mb // MEMORY_PER_JOB_MB)))
+                if affordable == 0:
+                    logger.warning(
+                        f"⚠️ Low memory ({headroom_mb:.0f}MB headroom), "
+                        "waiting before fetching more messages"
+                    )
+                    optimize_memory()
                     time.sleep(2)
                     continue
+                available = affordable
 
                 # --- Fetch messages (SQS max 10 per call) ---
                 # Use shorter wait when workers are busy so we re-check capacity faster
