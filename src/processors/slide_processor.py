@@ -35,37 +35,28 @@ class SlideProcessor:
         atexit.register(self.cleanup_all_temp_dirs)
         logger.info("Slide processor initialized")
     
-    def download_slide(self, slide_url: str, local_path: str) -> bool:
+    def download_slide(self, slide_url: str, local_path: str) -> str:
         """
-        Download slide from S3 URL to local path
-        
-        Args:
-            slide_url: S3 URL or HTTP URL
-            local_path: Local file path to save
-            
+        Download slide from S3 URL to local path.
+
         Returns:
-            True if successful, False otherwise
+            'ok'         – download succeeded
+            'not_found'  – S3 object does not exist (job was deleted)
+            'error'      – any other failure
         """
         try:
             # Parse S3 URL
             if slide_url.startswith('s3://'):
-                # s3://bucket/key
                 parts = slide_url.replace('s3://', '').split('/', 1)
                 bucket = parts[0]
                 key = parts[1] if len(parts) > 1 else ''
-                
                 return self.aws_client.download_from_s3(bucket, key, local_path)
-                
+
             elif slide_url.startswith('http'):
-                # HTTP URL - try to parse S3 URL from it
-                # Format: https://bucket.s3.region.amazonaws.com/key
-                # or: https://s3.region.amazonaws.com/bucket/key
                 parsed = urlparse(slide_url)
-                
-                # Try to extract bucket and key from S3 URL
                 bucket = None
                 key = None
-                
+
                 # Pattern 1: https://bucket.s3.region.amazonaws.com/key
                 if '.s3.' in parsed.netloc:
                     bucket = parsed.netloc.split('.s3.')[0]
@@ -76,13 +67,11 @@ class SlideProcessor:
                     if len(parts) >= 2:
                         bucket = parts[0]
                         key = parts[1]
-                
+
                 if bucket and key:
-                    # Download using boto3 (with credentials)
                     logger.info(f"Downloading from S3 via boto3: bucket={bucket}, key={key}")
                     return self.aws_client.download_from_s3(bucket, key, local_path)
                 else:
-                    # Fallback: try HTTP download (may fail if file is private)
                     logger.warning(f"Could not parse S3 URL, trying HTTP download: {slide_url}")
                     response = requests.get(slide_url, stream=True)
                     response.raise_for_status()
@@ -90,14 +79,14 @@ class SlideProcessor:
                         for chunk in response.iter_content(chunk_size=8192):
                             f.write(chunk)
                     logger.info(f"Downloaded slide from HTTP: {slide_url} -> {local_path}")
-                    return True
+                    return 'ok'
             else:
                 logger.error(f"Unsupported URL format: {slide_url}")
-                return False
-            
+                return 'error'
+
         except Exception as e:
             logger.error(f"Failed to download slide {slide_url}: {e}")
-            return False
+            return 'error'
     
     def generate_embedding(self, text: str) -> Optional[List[float]]:
         """
@@ -179,7 +168,8 @@ class SlideProcessor:
             'slides': None,  # List of {slideIndex, text, embedding} for alignment
             'pages': None,  # Raw page data (for debugging)
             'totalSlides': 0,
-            'error': None
+            'error': None,
+            'not_found': False,  # True when S3 object is gone (job deleted)
         }
         
         # Check memory before starting
@@ -200,7 +190,12 @@ class SlideProcessor:
             # Monitor memory usage
             check_memory_usage()
             # Download slide
-            if not self.download_slide(slide_url, slide_path):
+            download_status = self.download_slide(slide_url, slide_path)
+            if download_status == 'not_found':
+                result['error'] = 'Slide not found (job may have been deleted)'
+                result['not_found'] = True
+                return result
+            elif download_status != 'ok':
                 result['error'] = 'Failed to download slide'
                 return result
             
