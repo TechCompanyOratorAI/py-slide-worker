@@ -51,24 +51,39 @@ class MessageHandler:
             
             # Process slide
             result = self.slide_processor.process_slide(slide_url, slide_id)
-            
+
+            # If S3 file is gone the job was deleted – discard message immediately
+            if result.get('not_found'):
+                logger.warning(
+                    f"⚠️ Slide asset not found for job {job_id} (job may have been deleted) "
+                    "– discarding SQS message"
+                )
+                self._delete_message(queue_url, receipt_handle)
+                return
+
             # Send webhook based on result
             if result['success']:
-                webhook_sent = self.webhook_client.send_success_webhook(
+                webhook_ok, should_retry = self.webhook_client.send_success_webhook(
                     job_id, presentation_id, slide_id, result
                 )
             else:
                 error_message = result.get('error', 'Processing failed')
-                webhook_sent = self.webhook_client.send_failure_webhook(
+                webhook_ok, should_retry = self.webhook_client.send_failure_webhook(
                     job_id, presentation_id, slide_id, error_message
                 )
-            
-            # Delete message from queue if webhook was sent successfully
-            if webhook_sent:
+
+            if webhook_ok:
                 self._delete_message(queue_url, receipt_handle)
                 logger.info(f"✅ Message processed and deleted for job {job_id}")
+            elif not should_retry:
+                # Permanent failure (e.g. 4xx) – job was deleted on API side
+                logger.warning(
+                    f"⚠️ Webhook permanent failure for job {job_id} "
+                    "(job deleted?) – discarding SQS message"
+                )
+                self._delete_message(queue_url, receipt_handle)
             else:
-                logger.warning(f"⚠️ Webhook failed for job {job_id}, message not deleted (will retry)")
+                logger.warning(f"⚠️ Webhook transient failure for job {job_id}, message not deleted (will retry)")
             
         except Exception as e:
             logger.error(f"❌ Error processing message: {e}", exc_info=True)

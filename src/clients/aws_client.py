@@ -76,25 +76,33 @@ class AWSClient:
             logger.error(f"Failed to delete message from SQS: {e}")
             return False
     
-    def download_from_s3(self, bucket: str, key: str, local_path: str) -> bool:
+    def download_from_s3(self, bucket: str, key: str, local_path: str) -> str:
         """
-        Download file from S3
-        
-        Args:
-            bucket: S3 bucket name
-            key: S3 object key
-            local_path: Local file path to save
-            
+        Download file from S3.
+
         Returns:
-            True if successful, False otherwise
+            'ok'         – download succeeded
+            'not_found'  – S3 object does not exist (404 / NoSuchKey)
+            'error'      – any other failure
         """
         try:
+            # HeadObject is already called by boto3's download_file internally,
+            # but we catch the ClientError code explicitly here for clarity.
             self.s3_client.download_file(bucket, key, local_path)
             logger.info(f"Downloaded from S3: s3://{bucket}/{key} -> {local_path}")
-            return True
+            return 'ok'
         except Exception as e:
+            error_code = getattr(getattr(e, 'response', None), 'get', lambda *a: None)('Error', {}).get('Code', '')
+            # boto3 ClientError exposes the code via e.response['Error']['Code']
+            try:
+                error_code = e.response['Error']['Code']  # type: ignore[attr-defined]
+            except (AttributeError, KeyError, TypeError):
+                error_code = str(e)
+            if error_code in ('404', 'NoSuchKey'):
+                logger.warning(f"S3 object not found (404): s3://{bucket}/{key}")
+                return 'not_found'
             logger.error(f"Failed to download from S3: {e}")
-            return False
+            return 'error'
 
 # Global AWS client instance
 aws_client = None
