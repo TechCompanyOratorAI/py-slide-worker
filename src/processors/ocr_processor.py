@@ -72,19 +72,25 @@ class OCRProcessor:
             
             # Convert to grayscale
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            
+
+            # Detect dark-background slides (white text on dark bg) and invert
+            # so text is always dark on light background before thresholding
+            if gray.mean() < 128:
+                gray = cv2.bitwise_not(gray)
+
             # Apply denoising
             denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
-            
+
             # Increase contrast using CLAHE (Contrast Limited Adaptive Histogram Equalization)
             clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
             enhanced = clahe.apply(denoised)
-            
+
             # Apply threshold to get binary image
             _, binary = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            
-            # Save enhanced image
-            enhanced_path = image_path.replace('.', '_enhanced.')
+
+            # Save enhanced image (fix: use splitext to handle filenames with multiple dots)
+            base, ext = os.path.splitext(image_path)
+            enhanced_path = f"{base}_enhanced{ext}"
             cv2.imwrite(enhanced_path, binary)
             
             logger.debug(f"Enhanced image saved: {enhanced_path}")
@@ -186,9 +192,13 @@ class OCRProcessor:
                     try:
                         text = pytesseract.image_to_string(image, config=config)
                         text = ' '.join(text.split())  # Clean up whitespace
-                        
+
                         if text.strip() and (best_text is None or len(text) > len(best_text)):
                             best_text = text
+
+                        # Early exit: stop trying more PSM modes if result is good enough
+                        if best_text and len(best_text) >= 150:
+                            break
                     finally:
                         signal.alarm(0)  # Cancel timeout
                         
@@ -319,7 +329,8 @@ class OCRProcessor:
     def cleanup_enhanced_image(self, original_path: str):
         """Clean up enhanced image file if it exists"""
         try:
-            enhanced_path = original_path.replace('.', '_enhanced.')
+            base, ext = os.path.splitext(original_path)
+            enhanced_path = f"{base}_enhanced{ext}"
             if os.path.exists(enhanced_path):
                 os.remove(enhanced_path)
         except Exception as e:
