@@ -197,56 +197,68 @@ class PDFTextExtractor:
         
         try:
             from pdf2image import convert_from_path
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            from config.memory_config import PAGE_WORKERS
 
             page_numbers = [p['pageNumber'] for p in ocr_pages]
-            logger.info(f"Converting pages {page_numbers} to images for OCR")
+            logger.info(f"OCR fallback: {len(page_numbers)} pages, PAGE_WORKERS={PAGE_WORKERS}")
 
-            ocr_results = []
-
-            for page_num in page_numbers:
-                # Check memory before each page
-                if not is_memory_available(100):
-                    logger.warning(f"Stopping OCR at page {page_num} due to memory")
-                    break
-
-                # Convert only this single page
-                images = convert_from_path(
-                    pdf_path,
-                    dpi=DPI_SETTING,
-                    fmt='png',
-                    first_page=page_num,
-                    last_page=page_num
-                )
-
-                if not images:
-                    logger.warning(f"No image generated for page {page_num}")
-                    continue
-
-                temp_image_path = pdf_path.replace('.pdf', f'_ocr_page_{page_num}.png')
-                images[0].save(temp_image_path, 'PNG', quality=85, optimize=True)
-                del images
-                optimize_memory()
-
-                text = self.ocr_processor.extract_text_from_image(temp_image_path)
-
-                ocr_results.append({
-                    'pageNumber': page_num,
-                    'text': text or ''
-                })
-
+            def _process_one_page(page_num: int):
+                """Convert one PDF page to image and OCR it. Returns (page_num, text)."""
+                temp_img_path = None
                 try:
-                    os.remove(temp_image_path)
-                    base, ext = os.path.splitext(temp_image_path)
-                    enhanced_path = f"{base}_enhanced{ext}"
-                    if os.path.exists(enhanced_path):
-                        os.remove(enhanced_path)
+                    images = convert_from_path(
+                        pdf_path,
+                        dpi=DPI_SETTING,
+                        fmt='png',
+                        first_page=page_num,
+                        last_page=page_num
+                    )
+                    if not images:
+                        logger.warning(f"No image generated for page {page_num}")
+                        return page_num, ''
+
+                    temp_img_path = pdf_path.replace('.pdf', f'_ocr_page_{page_num}.png')
+                    images[0].save(temp_img_path, 'PNG', quality=85, optimize=True)
+                    del images
+                    optimize_memory()
+
+                    text = self.ocr_processor.extract_text_from_image(temp_img_path)
+                    logger.info(f"OCR page {page_num}: {len(text or '')} chars")
+                    return page_num, text or ''
+
                 except Exception as e:
-                    logger.debug(f"Failed to cleanup OCR temp files: {e}")
+                    logger.error(f"OCR page {page_num} failed: {e}")
+                    return page_num, ''
+                finally:
+                    if temp_img_path:
+                        try:
+                            if os.path.exists(temp_img_path):
+                                os.remove(temp_img_path)
+                            base, ext = os.path.splitext(temp_img_path)
+                            enhanced = f"{base}_enhanced{ext}"
+                            if os.path.exists(enhanced):
+                                os.remove(enhanced)
+                        except Exception:
+                            pass
 
-                logger.info(f"OCR page {page_num}: {len(text or '')} characters extracted")
+            # Process pages concurrently; semaphore in extract_text_from_image
+            # ensures total concurrent OCR ≤ MAX_CONCURRENT_OCR across all threads
+            results: Dict[int, str] = {}
+            with ThreadPoolExecutor(max_workers=PAGE_WORKERS) as executor:
+                future_to_page = {executor.submit(_process_one_page, pn): pn for pn in page_numbers}
+                for future in as_completed(future_to_page):
+                    pn = future_to_page[future]
+                    try:
+                        page_num, text = future.result()
+                        results[page_num] = text
+                    except Exception as e:
+                        logger.error(f"OCR page {pn} worker error: {e}")
+                        results[pn] = ''
 
-            return ocr_results
-            
+            # Return in original page order — critical for correct PDF structure
+            return [{'pageNumber': pn, 'text': results.get(pn, '')} for pn in page_numbers]
+
         except Exception as e:
             logger.error(f"OCR fallback failed: {e}")
             return []

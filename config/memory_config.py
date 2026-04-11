@@ -4,6 +4,7 @@ Memory optimization configuration for py-analysis-worker
 import os
 import gc
 import logging
+import threading
 
 try:
     import psutil
@@ -19,6 +20,16 @@ MAX_IMAGE_SIZE = 20971520  # 20MB max image size (doubled from 10MB)
 DPI_SETTING = 300  # DPI for OCR processing (300 is optimal for tesseract accuracy)
 MEMORY_LIMIT_MB = 1600  # 1600MB memory limit (80% of 2GB)
 MEMORY_WARNING_MB = 1200  # Warning threshold at 1200MB
+
+# Intra-job page parallelism
+# PAGE_WORKERS: concurrent pages/slides within ONE job
+PAGE_WORKERS = int(os.getenv('PAGE_WORKERS', '2'))
+
+# Global semaphore caps total concurrent OCR operations across ALL threads
+# Budget: (MEMORY_LIMIT_MB - base_461MB) / ~250MB_per_ocr ≈ 4-5
+# Keep at 4 to leave headroom for GC fragmentation
+MAX_CONCURRENT_OCR = int(os.getenv('MAX_CONCURRENT_OCR', '4'))
+_ocr_semaphore = threading.Semaphore(MAX_CONCURRENT_OCR)
 
 def optimize_memory():
     """Force garbage collection to free memory"""
