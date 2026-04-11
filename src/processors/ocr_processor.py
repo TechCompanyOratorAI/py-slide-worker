@@ -6,10 +6,11 @@ Handles text extraction from images and PDFs using pytesseract and easyocr
 import os
 import logging
 import signal
+import threading
 import time
 from typing import Optional, List, Dict
 from config.config import OCR_LANGUAGE, check_library_availability
-from config.memory_config import check_memory_usage, is_memory_available, optimize_memory, MAX_IMAGE_SIZE
+from config.memory_config import check_memory_usage, is_memory_available, optimize_memory, MAX_IMAGE_SIZE, _ocr_semaphore
 
 logger = logging.getLogger(__name__)
 
@@ -127,109 +128,107 @@ class OCRProcessor:
         if not is_memory_available(100):  # Reduced to 100MB for OCR
             logger.error("Insufficient memory for OCR processing")
             return None
-        
-        try:
-            # Monitor memory during processing
-            check_memory_usage()
-            # Enhance image for better OCR
-            enhanced_path = self.enhance_image(image_path)
-            
-            # Try EasyOCR first (better for Vietnamese)
-            if self.easyocr_reader:
-                try:
-                    logger.info(f"Using EasyOCR for: {image_path}")
-                    results = self.easyocr_reader.readtext(enhanced_path if enhanced_path != image_path else image_path)
-                    
-                    # Combine all detected text
-                    text_parts = []
-                    for (bbox, text, confidence) in results:
-                        if confidence > 0.5:  # Filter low confidence results
-                            text_parts.append(text)
-                    
-                    text = '\n'.join(text_parts)
-                    
-                    if text.strip():
-                        logger.info(f"EasyOCR extracted {len(text)} characters (confidence filtered)")
-                        return text.strip()
-                    else:
-                        logger.warning("EasyOCR returned empty text, falling back to pytesseract")
-                except Exception as e:
-                    logger.warning(f"EasyOCR failed: {e}. Falling back to pytesseract.")
-            
-            # Fallback to pytesseract
-            logger.info(f"Using pytesseract for: {image_path}")
-            
-            # Open image
-            image = Image.open(enhanced_path if enhanced_path != image_path else image_path)
-            
-            # OCR configuration for better Vietnamese support
-            # PSM 6: Assume a single uniform block of text
-            # PSM 11: Sparse text (for slides with scattered text)
-            # Try PSM 6 first, then 11 if needed
-            
-            # Try different PSM modes for better results with timeout
-            configs = [
-                f'--psm 6 -l {OCR_LANGUAGE}',  # Uniform block
-                f'--psm 11 -l {OCR_LANGUAGE}',  # Sparse text
-                f'--psm 3 -l {OCR_LANGUAGE}',   # Fully automatic
-            ]
-            
-            best_text = None
-            for i, config in enumerate(configs):
-                try:
-                    # Check memory before each attempt (reduced requirement)
-                    if not is_memory_available(30):
-                        logger.warning(f"Skipping OCR config {i+1} due to low memory")
-                        break
-                    
-                    # Set timeout for OCR operation (30 seconds max)
-                    def timeout_handler(signum, frame):
-                        raise TimeoutError("OCR operation timed out")
-                    
-                    signal.signal(signal.SIGALRM, timeout_handler)
-                    signal.alarm(30)  # 30 second timeout
-                    
+
+        # Semaphore caps total concurrent OCR across all threads/jobs
+        # preventing OOM when intra-job and inter-job parallelism overlap
+        with _ocr_semaphore:
+            try:
+                # Monitor memory during processing
+                check_memory_usage()
+                # Enhance image for better OCR
+                enhanced_path = self.enhance_image(image_path)
+
+                # Try EasyOCR first (better for Vietnamese)
+                if self.easyocr_reader:
                     try:
-                        text = pytesseract.image_to_string(image, config=config)
-                        text = ' '.join(text.split())  # Clean up whitespace
+                        logger.info(f"Using EasyOCR for: {image_path}")
+                        results = self.easyocr_reader.readtext(enhanced_path if enhanced_path != image_path else image_path)
 
-                        if text.strip() and (best_text is None or len(text) > len(best_text)):
-                            best_text = text
+                        # Combine all detected text
+                        text_parts = []
+                        for (bbox, text, confidence) in results:
+                            if confidence > 0.5:  # Filter low confidence results
+                                text_parts.append(text)
 
-                        # Early exit: stop trying more PSM modes if result is good enough
-                        if best_text and len(best_text) >= 150:
+                        text = '\n'.join(text_parts)
+
+                        if text.strip():
+                            logger.info(f"EasyOCR extracted {len(text)} characters (confidence filtered)")
+                            return text.strip()
+                        else:
+                            logger.warning("EasyOCR returned empty text, falling back to pytesseract")
+                    except Exception as e:
+                        logger.warning(f"EasyOCR failed: {e}. Falling back to pytesseract.")
+
+                # Fallback to pytesseract
+                logger.info(f"Using pytesseract for: {image_path}")
+
+                # Open image
+                image = Image.open(enhanced_path if enhanced_path != image_path else image_path)
+
+                # Try different PSM modes for better results with timeout
+                configs = [
+                    f'--psm 6 -l {OCR_LANGUAGE}',  # Uniform block
+                    f'--psm 11 -l {OCR_LANGUAGE}',  # Sparse text
+                    f'--psm 3 -l {OCR_LANGUAGE}',   # Fully automatic
+                ]
+
+                best_text = None
+                for i, config in enumerate(configs):
+                    try:
+                        # Check memory before each attempt
+                        if not is_memory_available(30):
+                            logger.warning(f"Skipping OCR config {i+1} due to low memory")
                             break
+
+                        # signal.SIGALRM only works on main thread
+                        _in_main = threading.current_thread() is threading.main_thread()
+                        if _in_main:
+                            def _timeout_handler(_signum, _frame):
+                                raise TimeoutError("OCR operation timed out")
+                            signal.signal(signal.SIGALRM, _timeout_handler)
+                            signal.alarm(30)
+
+                        try:
+                            text = pytesseract.image_to_string(image, config=config)
+                            text = ' '.join(text.split())
+
+                            if text.strip() and (best_text is None or len(text) > len(best_text)):
+                                best_text = text
+
+                            # Early exit if result is good enough
+                            if best_text and len(best_text) >= 150:
+                                break
+                        finally:
+                            if _in_main:
+                                signal.alarm(0)
+
+                    except TimeoutError:
+                        logger.warning(f"OCR config {i+1} timed out, trying next...")
+                        continue
+                    except Exception as e:
+                        logger.warning(f"OCR config {i+1} failed: {e}")
+                        continue
                     finally:
-                        signal.alarm(0)  # Cancel timeout
-                        
-                except TimeoutError:
-                    logger.warning(f"OCR config {i+1} timed out, trying next...")
-                    continue
-                except Exception as e:
-                    logger.warning(f"OCR config {i+1} failed: {e}")
-                    continue
-                finally:
-                    # Force cleanup after each attempt
-                    optimize_memory()
-            
-            if best_text and best_text.strip():
-                logger.info(f"Pytesseract extracted {len(best_text)} characters")
-                return best_text.strip()
-            else:
-                logger.warning("Pytesseract returned empty text")
+                        optimize_memory()
+
+                if best_text and best_text.strip():
+                    logger.info(f"Pytesseract extracted {len(best_text)} characters")
+                    return best_text.strip()
+                else:
+                    logger.warning("Pytesseract returned empty text")
+                    return None
+
+            except MemoryError as e:
+                logger.error(f"OCR failed due to memory exhaustion for {image_path}: {e}")
+                optimize_memory()
                 return None
-                
-        except MemoryError as e:
-            logger.error(f"OCR failed due to memory exhaustion for {image_path}: {e}")
-            optimize_memory()
-            return None
-        except Exception as e:
-            logger.error(f"OCR failed for {image_path}: {e}", exc_info=True)
-            optimize_memory()
-            return None
-        finally:
-            # Always cleanup memory after OCR
-            optimize_memory()
+            except Exception as e:
+                logger.error(f"OCR failed for {image_path}: {e}", exc_info=True)
+                optimize_memory()
+                return None
+            finally:
+                optimize_memory()
     
     def process_pdf_to_pages(self, pdf_path: str) -> List[Dict]:
         """

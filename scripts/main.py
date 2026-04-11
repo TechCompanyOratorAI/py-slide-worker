@@ -16,14 +16,18 @@ import logging
 import time
 import signal
 import threading
+from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
 
 # Add the parent directory (project root) to Python path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config.config import validate_config, SQS_QUEUE_URL
-from config.memory_config import check_memory_usage, optimize_memory
+from config.memory_config import check_memory_usage, optimize_memory, is_memory_available
 from src.clients.aws_client import get_aws_client
 from src.handlers.message_handler import get_message_handler
+
+# Number of concurrent worker threads (tune based on RAM: ~300MB per worker)
+WORKER_THREADS = int(os.getenv('WORKER_THREADS', '3'))
 
 logger = logging.getLogger(__name__)
 
@@ -44,70 +48,102 @@ def setup_signal_handlers():
 
 def poll_queue():
     """
-    Main loop: poll SQS queue for messages with health monitoring
+    Main loop: poll SQS queue and process messages concurrently via ThreadPoolExecutor.
+
+    Sliding-window approach:
+    - Track pending futures; drain completed ones each iteration
+    - Only fetch more messages when worker slots are available
+    - Memory guard prevents fetching when RAM is low
+    - Graceful shutdown waits for in-flight jobs to finish
     """
     global shutdown_requested
-    
-    logger.info(f"🚀 Starting slides worker, polling queue: {SQS_QUEUE_URL}")
-    
+
+    logger.info(f"🚀 Starting slides worker (threads={WORKER_THREADS}), queue: {SQS_QUEUE_URL}")
+
     if not SQS_QUEUE_URL:
         logger.error("❌ AWS_SQS_SLIDES_QUEUE_URL not configured")
         sys.exit(1)
-    
-    # Initialize components
+
     aws_client = get_aws_client()
     message_handler = get_message_handler()
-    
-    # Health monitoring
+
     last_health_check = time.time()
     health_check_interval = 300  # 5 minutes
     message_count = 0
-    
-    logger.info("✅ Worker initialized successfully, starting message polling...")
-    
-    while not shutdown_requested:
-        try:
-            # Periodic health check
-            current_time = time.time()
-            if current_time - last_health_check > health_check_interval:
-                logger.info(f"💓 Health check: processed {message_count} messages")
-                check_memory_usage()
-                optimize_memory()
-                last_health_check = current_time
-            
-            # Long polling: wait up to 20 seconds for messages
-            response = aws_client.receive_messages(
-                queue_url=SQS_QUEUE_URL,
-                max_messages=1,
-                wait_time=20
-            )
-            
-            messages = response.get('Messages', [])
-            
-            if messages:
+    pending = set()
+
+    logger.info("✅ Worker initialized, starting message polling...")
+
+    with ThreadPoolExecutor(max_workers=WORKER_THREADS) as executor:
+        while not shutdown_requested:
+            try:
+                # --- Drain completed futures ---
+                if pending:
+                    done, pending = futures_wait(pending, timeout=0)
+                    for f in done:
+                        try:
+                            f.result()
+                            message_count += 1
+                        except Exception as e:
+                            logger.error(f"❌ Job failed: {e}", exc_info=True)
+
+                # --- Periodic health check ---
+                now = time.time()
+                if now - last_health_check > health_check_interval:
+                    logger.info(f"💓 Health: {message_count} done, {len(pending)} in-flight")
+                    check_memory_usage()
+                    optimize_memory()
+                    last_health_check = now
+
+                # --- Check capacity ---
+                available = WORKER_THREADS - len(pending)
+                if available <= 0:
+                    time.sleep(0.1)
+                    continue
+
+                # --- Memory guard: ~300MB headroom per pending job ---
+                if not is_memory_available(300 * available):
+                    logger.warning("⚠️ Low memory, waiting before fetching more messages")
+                    time.sleep(2)
+                    continue
+
+                # --- Fetch messages (SQS max 10 per call) ---
+                # Use shorter wait when workers are busy so we re-check capacity faster
+                wait_time = 5 if pending else 20
+                response = aws_client.receive_messages(
+                    queue_url=SQS_QUEUE_URL,
+                    max_messages=min(available, 10),
+                    wait_time=wait_time
+                )
+
+                messages = response.get('Messages', [])
+                if not messages:
+                    logger.debug("No messages received, continuing to poll...")
+                    continue
+
                 for message in messages:
                     if shutdown_requested:
-                        logger.info("🛑 Shutdown requested, stopping message processing")
                         break
-                    
-                    try:
-                        message_handler.process_message(message, SQS_QUEUE_URL)
-                        message_count += 1
-                    except Exception as e:
-                        logger.error(f"❌ Error processing message: {e}", exc_info=True)
-                        # Continue with next message
-            else:
-                logger.debug("No messages received, continuing to poll...")
-                
-        except KeyboardInterrupt:
-            logger.info("🛑 Keyboard interrupt received, shutting down...")
-            shutdown_requested = True
-        except Exception as e:
-            logger.error(f"❌ Error in poll loop: {e}", exc_info=True)
-            # Continue polling even if there's an error, but wait a bit
-            if not shutdown_requested:
-                time.sleep(5)
-    
+                    future = executor.submit(
+                        message_handler.process_message, message, SQS_QUEUE_URL
+                    )
+                    pending.add(future)
+
+                logger.debug(f"Submitted {len(messages)} jobs, {len(pending)} in-flight")
+
+            except KeyboardInterrupt:
+                logger.info("🛑 Keyboard interrupt, shutting down...")
+                shutdown_requested = True
+            except Exception as e:
+                logger.error(f"❌ Poll loop error: {e}", exc_info=True)
+                if not shutdown_requested:
+                    time.sleep(5)
+
+        # --- Graceful shutdown: wait for in-flight jobs ---
+        if pending:
+            logger.info(f"🛑 Shutdown requested, waiting for {len(pending)} in-flight jobs...")
+            futures_wait(pending)
+
     logger.info(f"🏁 Worker shutdown complete. Processed {message_count} messages total.")
 
 

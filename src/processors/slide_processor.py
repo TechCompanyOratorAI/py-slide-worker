@@ -314,9 +314,10 @@ class SlideProcessor:
     
     def _process_pptx(self, pptx_path: str, result: Dict) -> Dict:
         """
-        Process PPTX/PPT file with two-pass strategy per slide:
-          1. Direct text extraction from text frames (fast, high confidence)
-          2. OCR fallback on embedded PICTURE shapes for image-heavy slides
+        Process PPTX/PPT file with three-phase strategy:
+          Phase 1 (sequential): extract text frames + write image blobs to temp files
+          Phase 2 (parallel):   OCR image-heavy slides concurrently via ThreadPoolExecutor
+          Phase 3 (sequential): merge results in original slide order, build output
         """
         if not LIBS.get('PPTX_AVAILABLE'):
             result['error'] = 'python-pptx not installed. Cannot process PPTX files.'
@@ -331,14 +332,18 @@ class SlideProcessor:
         try:
             from pptx import Presentation
             from pptx.enum.shapes import MSO_SHAPE_TYPE
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            from config.memory_config import PAGE_WORKERS
 
             prs = Presentation(pptx_path)
-            slides_data = []
-            all_text_parts = []
+
+            # ------------------------------------------------------------------
+            # Phase 1: sequential — read XML + write image blobs to disk
+            # ------------------------------------------------------------------
+            slide_info_list = []  # one dict per slide, preserves original order
 
             for slide_index, slide in enumerate(prs.slides, start=1):
-
-                # --- Pass 1: text frames ---
+                # Extract direct text from all text frames
                 text_parts = []
                 for shape in slide.shapes:
                     if shape.has_text_frame:
@@ -347,18 +352,14 @@ class SlideProcessor:
                             if para_text:
                                 text_parts.append(para_text)
 
-                slide_text = '\n'.join(text_parts).strip()
-                extraction_method = 'pptx_direct'
-                confidence = 'high'
+                direct_text = '\n'.join(text_parts).strip()
 
-                # --- Pass 2: OCR fallback for image-heavy slides ---
-                if len(slide_text) < MIN_TEXT_CHARS and LIBS.get('OCR_AVAILABLE'):
-                    ocr_texts = []
+                # Collect image blobs that need OCR (only when direct text is sparse)
+                image_items = []  # list of temp_img_path strings
+                if len(direct_text) < MIN_TEXT_CHARS and LIBS.get('OCR_AVAILABLE'):
                     for shape in slide.shapes:
                         if shape.shape_type != MSO_SHAPE_TYPE.PICTURE:
                             continue
-
-                        temp_img_path = None
                         try:
                             img_ext = shape.image.ext.lower()
                             if img_ext not in SUPPORTED_IMG_EXTS:
@@ -371,38 +372,95 @@ class SlideProcessor:
                             )
                             with open(temp_img_path, 'wb') as f:
                                 f.write(shape.image.blob)
-
-                            ocr_text = self.ocr_processor.extract_text_from_image(temp_img_path)
-                            if ocr_text:
-                                ocr_texts.append(ocr_text.strip())
-                                logger.debug(f"Slide {slide_index} shape {shape.shape_id}: OCR {len(ocr_text)} chars")
+                            image_items.append(temp_img_path)
 
                         except Exception as e:
-                            logger.warning(f"Slide {slide_index}: OCR fallback error for shape: {e}")
-                        finally:
-                            if temp_img_path:
-                                try:
-                                    if os.path.exists(temp_img_path):
-                                        os.remove(temp_img_path)
-                                    self.ocr_processor.cleanup_enhanced_image(temp_img_path)
-                                except Exception:
-                                    pass
+                            logger.warning(f"Slide {slide_index}: failed to write image blob for shape {shape.shape_id}: {e}")
 
-                    if ocr_texts:
-                        ocr_combined = '\n'.join(ocr_texts)
-                        slide_text = (slide_text + '\n' + ocr_combined).strip() if slide_text else ocr_combined
-                        extraction_method = 'pptx_ocr_fallback'
-                        confidence = 'medium'
-                        logger.info(f"Slide {slide_index}: OCR fallback → {len(ocr_combined)} chars")
-                    else:
-                        logger.debug(f"Slide {slide_index}: no text and no extractable images")
+                slide_info_list.append({
+                    'slideIndex': slide_index,
+                    'direct_text': direct_text,
+                    'image_items': image_items,
+                })
+
+            # ------------------------------------------------------------------
+            # Phase 2: parallel — OCR all image items for slides that need it
+            # ocr_results[slide_index] = combined OCR text for that slide
+            # ------------------------------------------------------------------
+            def _ocr_slide_images(slide_info: Dict) -> tuple:
+                """OCR all images for one slide; returns (slideIndex, combined_text)."""
+                slide_idx = slide_info['slideIndex']
+                ocr_texts = []
+                for temp_img_path in slide_info['image_items']:
+                    try:
+                        ocr_text = self.ocr_processor.extract_text_from_image(temp_img_path)
+                        if ocr_text:
+                            ocr_texts.append(ocr_text.strip())
+                            logger.debug(f"Slide {slide_idx} image '{temp_img_path}': OCR {len(ocr_text)} chars")
+                    except Exception as e:
+                        logger.warning(f"Slide {slide_idx}: OCR failed for '{temp_img_path}': {e}")
+                    finally:
+                        # Clean up temp image + enhanced variant
+                        try:
+                            if os.path.exists(temp_img_path):
+                                os.remove(temp_img_path)
+                            self.ocr_processor.cleanup_enhanced_image(temp_img_path)
+                        except Exception:
+                            pass
+                return slide_idx, '\n'.join(ocr_texts)
+
+            ocr_results: Dict[int, str] = {}
+            slides_needing_ocr = [si for si in slide_info_list if si['image_items']]
+
+            if slides_needing_ocr:
+                logger.info(f"PPTX: running OCR on {len(slides_needing_ocr)} image-heavy slides "
+                            f"(PAGE_WORKERS={PAGE_WORKERS})")
+                with ThreadPoolExecutor(max_workers=PAGE_WORKERS) as executor:
+                    future_to_slide = {
+                        executor.submit(_ocr_slide_images, si): si['slideIndex']
+                        for si in slides_needing_ocr
+                    }
+                    for future in as_completed(future_to_slide):
+                        slide_idx = future_to_slide[future]
+                        try:
+                            idx, combined_text = future.result()
+                            ocr_results[idx] = combined_text
+                        except Exception as e:
+                            logger.error(f"Slide {slide_idx}: OCR worker error: {e}")
+                            ocr_results[slide_idx] = ''
+
+            # ------------------------------------------------------------------
+            # Phase 3: sequential — merge in original order, build output
+            # ------------------------------------------------------------------
+            slides_data = []
+            all_text_parts = []
+
+            for si in slide_info_list:
+                slide_index = si['slideIndex']
+                direct_text = si['direct_text']
+                ocr_combined = ocr_results.get(slide_index, '')
+
+                if ocr_combined:
+                    slide_text = (direct_text + '\n' + ocr_combined).strip() if direct_text else ocr_combined
+                    extraction_method = 'pptx_ocr_fallback'
+                    confidence = 'medium'
+                    logger.info(f"Slide {slide_index}: OCR fallback → {len(ocr_combined)} chars")
+                elif direct_text:
+                    slide_text = direct_text
+                    extraction_method = 'pptx_direct'
+                    confidence = 'high'
+                else:
+                    slide_text = ''
+                    extraction_method = 'pptx_direct'
+                    confidence = 'low'
+                    logger.debug(f"Slide {slide_index}: no text and no extractable images")
 
                 slide_entry = {
                     'slideIndex': slide_index,
                     'text': slide_text,
                     'extractionMethod': extraction_method,
                     'confidence': confidence,
-                    'embedding': None
+                    'embedding': None,
                 }
                 slides_data.append(slide_entry)
 
@@ -419,7 +477,7 @@ class SlideProcessor:
                     'pageNumber': s['slideIndex'],
                     'text': s['text'],
                     'extractionMethod': s['extractionMethod'],
-                    'confidence': s['confidence']
+                    'confidence': s['confidence'],
                 }
                 for s in slides_data
             ]
