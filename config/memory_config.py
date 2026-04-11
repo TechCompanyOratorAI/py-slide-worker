@@ -70,6 +70,20 @@ def check_memory_usage():
         logger.warning(f"Memory check failed: {e}")
         return None
 
+def get_available_memory_mb() -> float:
+    """
+    Return remaining headroom (MB) before MEMORY_LIMIT_MB is hit.
+    Returns float('inf') if psutil is unavailable.
+    """
+    if not PSUTIL_AVAILABLE:
+        return float('inf')
+    try:
+        process = psutil.Process()
+        current_mb = process.memory_info().rss / 1024 / 1024
+        return max(0.0, MEMORY_LIMIT_MB - current_mb)
+    except:
+        return float('inf')
+
 def is_memory_available(required_mb: int = 100) -> bool:
     """
     Check if enough memory is available for an operation
@@ -80,17 +94,8 @@ def is_memory_available(required_mb: int = 100) -> bool:
     Returns:
         True if enough memory available
     """
-    if not PSUTIL_AVAILABLE:
-        return True  # Assume OK if can't check
-        
-    try:
-        process = psutil.Process()
-        current_mb = process.memory_info().rss / 1024 / 1024
-        available_mb = MEMORY_LIMIT_MB - current_mb
-        
-        if available_mb < required_mb:
-            logger.warning(f"⚠️ Insufficient memory: need {required_mb}MB, available {available_mb:.1f}MB")
-            return False
-        return True
-    except:
-        return True  # Assume OK if can't check
+    available_mb = get_available_memory_mb()
+    if available_mb < required_mb:
+        logger.warning(f"⚠️ Insufficient memory: need {required_mb}MB, available {available_mb:.1f}MB")
+        return False
+    return True
