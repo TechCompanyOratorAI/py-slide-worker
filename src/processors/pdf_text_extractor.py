@@ -263,12 +263,30 @@ class PDFTextExtractor:
             logger.error(f"OCR fallback failed: {e}")
             return []
 
-# Global PDF text extractor instance
-pdf_text_extractor = None
+# Global PDF text extractor instance + lock for thread-safe initialisation
+import threading as _threading
+_pdf_extractor_lock = _threading.Lock()
+_pdf_text_extractor: "PDFTextExtractor | None" = None
 
-def get_pdf_text_extractor(ocr_processor=None):
-    """Get singleton PDF text extractor instance"""
-    global pdf_text_extractor
-    if pdf_text_extractor is None:
-        pdf_text_extractor = PDFTextExtractor(ocr_processor)
-    return pdf_text_extractor
+def get_pdf_text_extractor(ocr_processor=None) -> "PDFTextExtractor":
+    """
+    Get the singleton PDFTextExtractor instance.
+
+    Thread-safe: uses a module-level lock so that concurrent calls from
+    multiple SQS-worker threads cannot each create their own instance.
+
+    If the singleton was previously created with ocr_processor=None but a
+    real processor is now available, the processor is wired in retroactively
+    so OCR fallback becomes available without restarting the process.
+    """
+    global _pdf_text_extractor
+    with _pdf_extractor_lock:
+        if _pdf_text_extractor is None:
+            _pdf_text_extractor = PDFTextExtractor(ocr_processor)
+            logger.info("PDFTextExtractor singleton created")
+        elif ocr_processor is not None and _pdf_text_extractor.ocr_processor is None:
+            # Retroactively attach a real OCR processor that wasn't available
+            # when the singleton was first constructed.
+            _pdf_text_extractor.ocr_processor = ocr_processor
+            logger.info("PDFTextExtractor: ocr_processor updated (was None)")
+    return _pdf_text_extractor
