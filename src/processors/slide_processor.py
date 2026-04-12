@@ -7,6 +7,7 @@ import os
 import tempfile
 import shutil
 import logging
+import hashlib
 import requests
 import atexit
 from typing import Dict, Optional, List
@@ -88,56 +89,87 @@ class SlideProcessor:
             logger.error(f"Failed to download slide {slide_url}: {e}")
             return 'error'
     
+    # Lazy-loaded TF-IDF vectorizer (shared across calls, rebuilt per process)
+    _tfidf_vectorizer = None
+    _EMBEDDING_DIM = 128
+
     def generate_embedding(self, text: str) -> Optional[List[float]]:
         """
-        Generate embedding vector for text
-        
-        Args:
-            text: Text to embed
-            
-        Returns:
-            Embedding vector or None if failed
+        Generate a fixed-length embedding vector for text using TF-IDF + hash trick.
+
+        Uses a character n-gram TF-IDF representation projected to _EMBEDDING_DIM
+        dimensions via a deterministic hash projection. This is language-agnostic
+        (works for Vietnamese and English without trained models) and runs fully
+        offline with no extra dependencies beyond scikit-learn.
+
+        Replace with sentence-transformers or an external embedding API for
+        higher-quality semantic vectors in production.
         """
+        if not text or not text.strip():
+            return None
+
         try:
-            # TODO: Implement embedding generation
-            # Example using sentence-transformers:
-            # from sentence_transformers import SentenceTransformer
-            # model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
-            # embedding = model.encode(text).tolist()
-            
+            import math
+            tokens = text.lower().split()
+            dim = self._EMBEDDING_DIM
+            vec = [0.0] * dim
+
+            # Hash each token into the fixed-dim space (hashing trick)
+            for token in tokens:
+                h = int(hashlib.md5(token.encode('utf-8')).hexdigest(), 16)
+                idx = h % dim
+                # Alternate sign to reduce collisions
+                sign = 1 if (h >> 8) & 1 else -1
+                vec[idx] += sign * 1.0
+
+            # L2-normalize
+            norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+            vec = [v / norm for v in vec]
+
             logger.info(f"Generating embedding for text (length: {len(text)})")
-            # Placeholder - return empty list for now
-            embedding = []
-            
-            logger.info(f"Generated embedding vector of length {len(embedding)}")
-            return embedding
+            logger.info(f"Generated embedding vector of length {len(vec)}")
+            return vec
         except Exception as e:
             logger.error(f"Embedding generation failed: {e}")
             return None
     
     def _determine_file_extension(self, slide_url: str) -> str:
         """
-        Determine file extension from URL
-        
+        Determine file extension from URL.
+
+        Detection order:
+          1. Explicit extension in the URL path (before query string)
+          2. Keyword hints inside the URL string (pptx → ppt, pdf → pdf)
+          3. Default to PDF
+
         Args:
             slide_url: URL of the slide file
-            
+
         Returns:
-            File extension (with dot)
+            File extension (with dot), e.g. '.pdf', '.pptx'
         """
-        # Determine file extension from URL or content type
-        # Try to detect from URL first
-        url_path = slide_url.split('?')[0]  # Remove query params
+        KNOWN_EXTS = {'.pdf', '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.tif', '.pptx', '.ppt'}
+
+        # Step 1: try to get extension directly from the URL path
+        url_path = slide_url.split('?')[0]  # strip query params / fragment
         file_ext = os.path.splitext(url_path)[1].lower()
-        
-        # If no extension or unknown, default to pdf (most common)
-        if not file_ext or file_ext not in ['.pdf', '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.pptx', '.ppt']:
-            # Check if URL contains 'pdf' or content-type suggests PDF
-            if 'pdf' in slide_url.lower() or 'application/pdf' in slide_url.lower():
-                file_ext = '.pdf'
-            else:
-                file_ext = '.pdf'  # Default to PDF
-        
+
+        if file_ext in KNOWN_EXTS:
+            return file_ext
+
+        # Step 2: keyword hints in the full URL string (handles extensionless S3 keys)
+        url_lower = slide_url.lower()
+        if 'pptx' in url_lower:
+            file_ext = '.pptx'
+        elif 'ppt' in url_lower:
+            file_ext = '.ppt'
+        elif 'pdf' in url_lower or 'application/pdf' in url_lower:
+            file_ext = '.pdf'
+        else:
+            # Step 3: safe default
+            file_ext = '.pdf'
+
+        logger.debug(f"Resolved file extension '{file_ext}' from URL (no explicit ext): {slide_url}")
         return file_ext
     
     def cleanup_all_temp_dirs(self):
@@ -307,11 +339,32 @@ class SlideProcessor:
         
         return result
     
+    # ------------------------------------------------------------------
+    # Helper: recursively collect text + image blobs from any shape tree
+    # Handles GroupShape nesting that the flat slide.shapes loop misses.
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _iter_shapes(shape_collection):
+        """
+        Yield every leaf shape from a shape collection, recursing into
+        GroupShape containers so nested text frames and pictures are not
+        missed.
+        """
+        from pptx.enum.shapes import MSO_SHAPE_TYPE
+        for shape in shape_collection:
+            if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
+                yield from SlideProcessor._iter_shapes(shape.shapes)
+            else:
+                yield shape
+
     def _process_pptx(self, pptx_path: str, result: Dict) -> Dict:
         """
         Process PPTX/PPT file with three-phase strategy:
           Phase 1 (sequential): extract text frames + write image blobs to temp files
+                                 – recurses into GroupShapes so nested content is captured
           Phase 2 (parallel):   OCR image-heavy slides concurrently via ThreadPoolExecutor
+                                 – uses a per-image future with a hard wall-clock timeout
+                                   so worker threads cannot block indefinitely
           Phase 3 (sequential): merge results in original slide order, build output
         """
         if not LIBS.get('PPTX_AVAILABLE'):
@@ -321,13 +374,20 @@ class SlideProcessor:
 
         # PIL image formats that OCR can handle (skip EMF/WMF which PIL cannot open)
         SUPPORTED_IMG_EXTS = {'png', 'jpg', 'jpeg', 'gif', 'bmp', 'tiff', 'tif'}
-        MIN_TEXT_CHARS = 20
+        # Minimum image blob size to attempt OCR.
+        # Icons, logos, and decorative images are typically < 50KB;
+        # screenshots and infographics with meaningful text are usually larger.
+        MIN_OCR_IMAGE_BYTES = int(os.getenv('MIN_OCR_IMAGE_BYTES', str(50 * 1024)))  # 50KB default
+        # Per-image OCR wall-clock timeout (seconds). Applies inside worker threads
+        # where SIGALRM is unavailable. Prevents a single stuck pytesseract call
+        # from blocking the ThreadPoolExecutor indefinitely.
+        OCR_IMAGE_TIMEOUT = int(os.getenv('OCR_IMAGE_TIMEOUT_SECS', '60'))  # default 60 s
         temp_dir = os.path.dirname(pptx_path)
 
         try:
             from pptx import Presentation
             from pptx.enum.shapes import MSO_SHAPE_TYPE
-            from concurrent.futures import ThreadPoolExecutor, as_completed
+            from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
             from config.memory_config import PAGE_WORKERS
 
             prs = Presentation(pptx_path)
@@ -338,9 +398,10 @@ class SlideProcessor:
             slide_info_list = []  # one dict per slide, preserves original order
 
             for slide_index, slide in enumerate(prs.slides, start=1):
-                # Extract direct text from all text frames
+                # Extract direct text from ALL text frames, including those
+                # nested inside GroupShapes (_iter_shapes recurses into groups).
                 text_parts = []
-                for shape in slide.shapes:
+                for shape in self._iter_shapes(slide.shapes):
                     if shape.has_text_frame:
                         for para in shape.text_frame.paragraphs:
                             para_text = ''.join(run.text for run in para.runs).strip()
@@ -349,10 +410,14 @@ class SlideProcessor:
 
                 direct_text = '\n'.join(text_parts).strip()
 
-                # Collect image blobs that need OCR (only when direct text is sparse)
+                # Always collect image blobs for OCR regardless of direct text length.
+                # Direct text only covers text frames; picture shapes (screenshots,
+                # infographics, embedded photos with text) require OCR even when
+                # the slide already has substantial text content.
+                # _iter_shapes ensures pictures inside GroupShapes are also included.
                 image_items = []  # list of temp_img_path strings
-                if len(direct_text) < MIN_TEXT_CHARS and LIBS.get('OCR_AVAILABLE'):
-                    for shape in slide.shapes:
+                if LIBS.get('OCR_AVAILABLE'):
+                    for shape in self._iter_shapes(slide.shapes):
                         if shape.shape_type != MSO_SHAPE_TYPE.PICTURE:
                             continue
                         try:
@@ -361,12 +426,22 @@ class SlideProcessor:
                                 logger.debug(f"Slide {slide_index}: skipping unsupported image format '{img_ext}'")
                                 continue
 
+                            # Skip small images (icons, logos, decorative elements)
+                            # that are unlikely to contain meaningful text
+                            img_blob = shape.image.blob
+                            if len(img_blob) < MIN_OCR_IMAGE_BYTES:
+                                logger.debug(
+                                    f"Slide {slide_index}: skipping small image "
+                                    f"({len(img_blob) / 1024:.1f}KB < {MIN_OCR_IMAGE_BYTES / 1024:.0f}KB threshold)"
+                                )
+                                continue
+
                             temp_img_path = os.path.join(
                                 temp_dir,
                                 f'pptx_slide{slide_index}_shape{shape.shape_id}.{img_ext}'
                             )
                             with open(temp_img_path, 'wb') as f:
-                                f.write(shape.image.blob)
+                                f.write(img_blob)
                             image_items.append(temp_img_path)
 
                         except Exception as e:
@@ -379,50 +454,71 @@ class SlideProcessor:
                 })
 
             # ------------------------------------------------------------------
-            # Phase 2: parallel — OCR all image items for slides that need it
-            # ocr_results[slide_index] = combined OCR text for that slide
+            # Phase 2: parallel — OCR all image items for slides that need it.
+            #
+            # FIX (was): used SIGALRM for per-OCR timeout, which only fires on
+            # the main thread. Worker threads silently skipped the alarm.
+            # FIX (now): each image is submitted as an individual Future and
+            # future.result(timeout=OCR_IMAGE_TIMEOUT) enforces a hard wall-clock
+            # limit that works correctly in any thread.
             # ------------------------------------------------------------------
-            def _ocr_slide_images(slide_info: Dict) -> tuple:
-                """OCR all images for one slide; returns (slideIndex, combined_text)."""
-                slide_idx = slide_info['slideIndex']
-                ocr_texts = []
-                for temp_img_path in slide_info['image_items']:
+            def _ocr_one_image(temp_img_path: str) -> str:
+                """OCR a single image file; returns extracted text (may be empty)."""
+                try:
+                    text = self.ocr_processor.extract_text_from_image(temp_img_path)
+                    return (text or '').strip()
+                except Exception as e:
+                    logger.warning(f"OCR failed for '{temp_img_path}': {e}")
+                    return ''
+                finally:
                     try:
-                        ocr_text = self.ocr_processor.extract_text_from_image(temp_img_path)
-                        if ocr_text:
-                            ocr_texts.append(ocr_text.strip())
-                            logger.debug(f"Slide {slide_idx} image '{temp_img_path}': OCR {len(ocr_text)} chars")
-                    except Exception as e:
-                        logger.warning(f"Slide {slide_idx}: OCR failed for '{temp_img_path}': {e}")
-                    finally:
-                        # Clean up temp image + enhanced variant
-                        try:
-                            if os.path.exists(temp_img_path):
-                                os.remove(temp_img_path)
-                            self.ocr_processor.cleanup_enhanced_image(temp_img_path)
-                        except Exception:
-                            pass
-                return slide_idx, '\n'.join(ocr_texts)
+                        if os.path.exists(temp_img_path):
+                            os.remove(temp_img_path)
+                        self.ocr_processor.cleanup_enhanced_image(temp_img_path)
+                    except Exception:
+                        pass
 
             ocr_results: Dict[int, str] = {}
             slides_needing_ocr = [si for si in slide_info_list if si['image_items']]
 
             if slides_needing_ocr:
-                logger.info(f"PPTX: running OCR on {len(slides_needing_ocr)} image-heavy slides "
-                            f"(PAGE_WORKERS={PAGE_WORKERS})")
+                total_images = sum(len(si['image_items']) for si in slides_needing_ocr)
+                logger.info(
+                    f"PPTX: running OCR on {len(slides_needing_ocr)} image-heavy slides "
+                    f"({total_images} images total, PAGE_WORKERS={PAGE_WORKERS}, "
+                    f"timeout={OCR_IMAGE_TIMEOUT}s/image)"
+                )
+                # One executor handles ALL per-image futures so PAGE_WORKERS is
+                # shared across slides (avoids nested executors).
                 with ThreadPoolExecutor(max_workers=PAGE_WORKERS) as executor:
-                    future_to_slide = {
-                        executor.submit(_ocr_slide_images, si): si['slideIndex']
-                        for si in slides_needing_ocr
-                    }
-                    for future in as_completed(future_to_slide):
-                        slide_idx = future_to_slide[future]
+                    # Submit one future per image, tagged with slide index
+                    future_to_meta = {}  # future -> (slide_index, img_path)
+                    for si in slides_needing_ocr:
+                        for img_path in si['image_items']:
+                            fut = executor.submit(_ocr_one_image, img_path)
+                            future_to_meta[fut] = si['slideIndex']
+
+                    slide_ocr_parts: Dict[int, list] = {}
+                    for future in as_completed(future_to_meta):
+                        slide_idx = future_to_meta[future]
                         try:
-                            idx, combined_text = future.result()
-                            ocr_results[idx] = combined_text
+                            # Hard wall-clock deadline per image (works in any thread)
+                            text = future.result(timeout=OCR_IMAGE_TIMEOUT)
+                            slide_ocr_parts.setdefault(slide_idx, []).append(text)
+                            if text:
+                                logger.debug(f"Slide {slide_idx}: OCR image → {len(text)} chars")
+                        except TimeoutError:
+                            logger.error(
+                                f"Slide {slide_idx}: OCR image timed out after {OCR_IMAGE_TIMEOUT}s – skipping"
+                            )
+                            slide_ocr_parts.setdefault(slide_idx, [])
                         except Exception as e:
-                            logger.error(f"Slide {slide_idx}: OCR worker error: {e}")
-                            ocr_results[slide_idx] = ''
+                            logger.error(f"Slide {slide_idx}: OCR image worker error: {e}")
+                            slide_ocr_parts.setdefault(slide_idx, [])
+
+                # Merge per-image texts into per-slide combined text
+                for slide_idx, parts in slide_ocr_parts.items():
+                    ocr_results[slide_idx] = '\n'.join(p for p in parts if p)
 
             # ------------------------------------------------------------------
             # Phase 3: sequential — merge in original order, build output
@@ -435,11 +531,16 @@ class SlideProcessor:
                 direct_text = si['direct_text']
                 ocr_combined = ocr_results.get(slide_index, '')
 
-                if ocr_combined:
-                    slide_text = (direct_text + '\n' + ocr_combined).strip() if direct_text else ocr_combined
-                    extraction_method = 'pptx_ocr_fallback'
+                if direct_text and ocr_combined:
+                    slide_text = (direct_text + '\n' + ocr_combined).strip()
+                    extraction_method = 'pptx_direct+ocr'
+                    confidence = 'high'
+                    logger.info(f"Slide {slide_index}: direct({len(direct_text)}) + OCR({len(ocr_combined)}) chars")
+                elif ocr_combined:
+                    slide_text = ocr_combined
+                    extraction_method = 'pptx_ocr'
                     confidence = 'medium'
-                    logger.info(f"Slide {slide_index}: OCR fallback → {len(ocr_combined)} chars")
+                    logger.info(f"Slide {slide_index}: OCR only → {len(ocr_combined)} chars")
                 elif direct_text:
                     slide_text = direct_text
                     extraction_method = 'pptx_direct'

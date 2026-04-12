@@ -14,6 +14,33 @@ from config.memory_config import check_memory_usage, is_memory_available, optimi
 
 logger = logging.getLogger(__name__)
 
+# Auto-detect and set TESSDATA_PREFIX if not already configured
+def _setup_tessdata_prefix():
+    """Detect the correct tessdata directory and set TESSDATA_PREFIX."""
+    if os.environ.get('TESSDATA_PREFIX'):
+        return  # Already set externally
+
+    candidate_dirs = [
+        '/usr/share/tesseract-ocr/5/tessdata',
+        '/usr/share/tesseract-ocr/4/tessdata',
+        '/usr/share/tessdata',
+        '/usr/local/share/tessdata',
+    ]
+    for path in candidate_dirs:
+        if os.path.isdir(path) and any(
+            f.endswith('.traineddata') for f in os.listdir(path)
+        ):
+            os.environ['TESSDATA_PREFIX'] = path
+            logger.info(f"Auto-detected TESSDATA_PREFIX: {path}")
+            return
+
+    logger.warning(
+        "Could not auto-detect tessdata directory. "
+        "Set TESSDATA_PREFIX environment variable manually."
+    )
+
+_setup_tessdata_prefix()
+
 # Check library availability
 LIBS = check_library_availability()
 
@@ -181,7 +208,17 @@ class OCRProcessor:
                             logger.warning(f"Skipping OCR config {i+1} due to low memory")
                             break
 
-                        # signal.SIGALRM only works on main thread
+                        # -------------------------------------------------------
+                        # Timeout strategy:
+                        #   Main thread  → SIGALRM provides a hard 30-second
+                        #                  deadline via the OS signal mechanism.
+                        #   Worker thread → SIGALRM is silently ignored by the OS
+                        #                  (signals always fire on the main thread).
+                        #                  Callers running OCR inside a
+                        #                  ThreadPoolExecutor MUST enforce the
+                        #                  deadline externally by calling
+                        #                  future.result(timeout=<secs>).
+                        # -------------------------------------------------------
                         _in_main = threading.current_thread() is threading.main_thread()
                         if _in_main:
                             def _timeout_handler(_signum, _frame):
