@@ -16,27 +16,66 @@ logger = logging.getLogger(__name__)
 
 # Auto-detect and set TESSDATA_PREFIX if not already configured
 def _setup_tessdata_prefix():
-    """Detect the correct tessdata directory and set TESSDATA_PREFIX."""
+    """
+    Detect the correct tessdata directory and set TESSDATA_PREFIX.
+
+    Search order:
+      1. Explicit env var (skip if already set)
+      2. DigitalOcean buildpack path  (/layers/digitalocean_apt/apt/...)
+      3. Standard distro paths
+      4. Glob scan for any installed tesseract version (4.00, 4.1, 5.x, etc.)
+    """
     if os.environ.get('TESSDATA_PREFIX'):
-        return  # Already set externally
+        existing = os.environ['TESSDATA_PREFIX']
+        logger.info(f"TESSDATA_PREFIX already set: {existing}")
+        return
+
+    import glob
 
     candidate_dirs = [
+        # DigitalOcean buildpack apt layer (highest priority — confirmed working)
+        '/layers/digitalocean_apt/apt/usr/share/tesseract-ocr/4.00/tessdata',
+        '/layers/digitalocean_apt/apt/usr/share/tesseract-ocr/5.00/tessdata',
+        # Standard paths with exact version
+        '/usr/share/tesseract-ocr/4.00/tessdata',
+        '/usr/share/tesseract-ocr/5.00/tessdata',
         '/usr/share/tesseract-ocr/5/tessdata',
         '/usr/share/tesseract-ocr/4/tessdata',
         '/usr/share/tessdata',
         '/usr/local/share/tessdata',
+        '/opt/homebrew/share/tessdata',
     ]
-    for path in candidate_dirs:
-        if os.path.isdir(path) and any(
-            f.endswith('.traineddata') for f in os.listdir(path)
-        ):
-            os.environ['TESSDATA_PREFIX'] = path
-            logger.info(f"Auto-detected TESSDATA_PREFIX: {path}")
-            return
 
-    logger.warning(
-        "Could not auto-detect tessdata directory. "
-        "Set TESSDATA_PREFIX environment variable manually."
+    # Append glob-discovered paths (catches any installed version: 4.1, 5.3, etc.)
+    for pattern in [
+        '/layers/digitalocean_apt/apt/usr/share/tesseract-ocr/*/tessdata',
+        '/usr/share/tesseract-ocr/*/tessdata',
+        '/usr/local/share/tesseract-ocr/*/tessdata',
+    ]:
+        for discovered in sorted(glob.glob(pattern), reverse=True):  # newest first
+            if discovered not in candidate_dirs:
+                candidate_dirs.append(discovered)
+
+    for path in candidate_dirs:
+        try:
+            if not os.path.isdir(path):
+                continue
+            traineddata_files = [f for f in os.listdir(path) if f.endswith('.traineddata')]
+            if traineddata_files:
+                os.environ['TESSDATA_PREFIX'] = path
+                langs = [f.replace('.traineddata', '') for f in traineddata_files[:5]]
+                logger.info(
+                    f"Auto-detected TESSDATA_PREFIX: {path} "
+                    f"(languages: {langs}{'...' if len(traineddata_files) > 5 else ''})"
+                )
+                return
+        except Exception as e:
+            logger.debug(f"Skipping tessdata candidate {path}: {e}")
+
+    logger.error(
+        "❌ Could not auto-detect tessdata directory. "
+        "Set TESSDATA_PREFIX environment variable manually. "
+        "Run: find / -name 'eng.traineddata' 2>/dev/null"
     )
 
 _setup_tessdata_prefix()
@@ -195,12 +234,13 @@ class OCRProcessor:
 
                 # Try different PSM modes for better results with timeout
                 configs = [
-                    f'--psm 6 -l {OCR_LANGUAGE}',  # Uniform block
+                    f'--psm 6 -l {OCR_LANGUAGE}',  # Uniform block of text
                     f'--psm 11 -l {OCR_LANGUAGE}',  # Sparse text
-                    f'--psm 3 -l {OCR_LANGUAGE}',   # Fully automatic
+                    f'--psm 3 -l {OCR_LANGUAGE}',   # Fully automatic page seg
                 ]
 
                 best_text = None
+                failed_configs = []
                 for i, config in enumerate(configs):
                     try:
                         # Check memory before each attempt
@@ -210,7 +250,7 @@ class OCRProcessor:
 
                         # -------------------------------------------------------
                         # Timeout strategy:
-                        #   Main thread  → SIGALRM provides a hard 30-second
+                        #   Main thread  → SIGALRM provides a hard 20-second
                         #                  deadline via the OS signal mechanism.
                         #   Worker thread → SIGALRM is silently ignored by the OS
                         #                  (signals always fire on the main thread).
@@ -224,7 +264,7 @@ class OCRProcessor:
                             def _timeout_handler(_signum, _frame):
                                 raise TimeoutError("OCR operation timed out")
                             signal.signal(signal.SIGALRM, _timeout_handler)
-                            signal.alarm(30)
+                            signal.alarm(20)  # Reduced from 30s → 20s per config
 
                         try:
                             text = pytesseract.image_to_string(image, config=config)
@@ -234,20 +274,30 @@ class OCRProcessor:
                                 best_text = text
 
                             # Early exit if result is good enough
-                            if best_text and len(best_text) >= 150:
+                            if best_text and len(best_text) >= 100:
                                 break
                         finally:
                             if _in_main:
                                 signal.alarm(0)
 
                     except TimeoutError:
-                        logger.warning(f"OCR config {i+1} timed out, trying next...")
+                        logger.debug(f"OCR config {i+1} timed out")
+                        failed_configs.append(f'psm_{config.split()[1]}_timeout')
                         continue
                     except Exception as e:
-                        logger.warning(f"OCR config {i+1} failed: {e}")
+                        # Collect failures silently; log once at the end
+                        failed_configs.append(f'psm_{config.split()[1]}')
+                        logger.debug(f"OCR config {i+1} failed: {e}")
                         continue
                     finally:
                         optimize_memory()
+
+                # Log all failures in one message instead of per-config spam
+                if failed_configs:
+                    logger.warning(
+                        f"OCR configs failed for {image_path}: {failed_configs}. "
+                        f"Check TESSDATA_PREFIX={os.environ.get('TESSDATA_PREFIX', 'NOT SET')}"
+                    )
 
                 if best_text and best_text.strip():
                     logger.info(f"Pytesseract extracted {len(best_text)} characters")
