@@ -42,7 +42,8 @@ class WebhookClient:
                 'embedding': result.get('embedding')
             }
         }
-        return self._send_webhook(payload, job_id)
+        return self._send_webhook(payload, job_id, idempotency_key=f"{job_id}-{slide_id}")
+
 
     def send_failure_webhook(
         self, job_id: int, presentation_id: int, slide_id: int, error: str
@@ -61,9 +62,9 @@ class WebhookClient:
             'timestamp': datetime.now(timezone.utc).isoformat(),
             'error': error
         }
-        return self._send_webhook(payload, job_id)
+        return self._send_webhook(payload, job_id, idempotency_key=f"{job_id}-{slide_id}-fail")
 
-    def _send_webhook(self, payload: Dict, job_id: int) -> Tuple[bool, bool]:
+    def _send_webhook(self, payload: Dict, job_id: int, idempotency_key: str = None) -> Tuple[bool, bool]:
         """
         Send webhook request.
 
@@ -76,6 +77,8 @@ class WebhookClient:
         headers = {'Content-Type': 'application/json'}
         if self.webhook_secret:
             headers['Authorization'] = f'Bearer {self.webhook_secret}'
+        if idempotency_key:
+            headers['Idempotency-Key'] = idempotency_key
 
         try:
             response = requests.post(
