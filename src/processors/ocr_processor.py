@@ -249,37 +249,26 @@ class OCRProcessor:
                             break
 
                         # -------------------------------------------------------
-                        # Timeout strategy:
-                        #   Main thread  → SIGALRM provides a hard 20-second
-                        #                  deadline via the OS signal mechanism.
-                        #   Worker thread → SIGALRM is silently ignored by the OS
-                        #                  (signals always fire on the main thread).
-                        #                  Callers running OCR inside a
-                        #                  ThreadPoolExecutor MUST enforce the
-                        #                  deadline externally by calling
-                        #                  future.result(timeout=<secs>).
+                        # Strict subprocess timeout mapping to PyTesseract
                         # -------------------------------------------------------
-                        _in_main = threading.current_thread() is threading.main_thread()
-                        if _in_main:
-                            def _timeout_handler(_signum, _frame):
-                                raise TimeoutError("OCR operation timed out")
-                            signal.signal(signal.SIGALRM, _timeout_handler)
-                            signal.alarm(20)  # Reduced from 30s → 20s per config
+                        # pytesseract's timeout enforces subprocess-level kill.
+                        # Pass timeout=20 directly to pytesseract so it kills the C++ process
+                        text = pytesseract.image_to_string(image, config=config, timeout=20)
+                        text = ' '.join(text.split())
 
-                        try:
-                            text = pytesseract.image_to_string(image, config=config)
-                            text = ' '.join(text.split())
+                        if text.strip() and (best_text is None or len(text) > len(best_text)):
+                            best_text = text
 
-                            if text.strip() and (best_text is None or len(text) > len(best_text)):
-                                best_text = text
+                        # Early exit if result is good enough
+                        if best_text and len(best_text) >= 100:
+                            break
 
-                            # Early exit if result is good enough
-                            if best_text and len(best_text) >= 100:
-                                break
-                        finally:
-                            if _in_main:
-                                signal.alarm(0)
-
+                    except RuntimeError as e:
+                        if 'timeout' in str(e).lower():
+                            logger.debug(f"OCR config {i+1} timed out (via RuntimeError)")
+                            failed_configs.append(f'psm_{config.split()[1]}_timeout')
+                            continue
+                        raise
                     except TimeoutError:
                         logger.debug(f"OCR config {i+1} timed out")
                         failed_configs.append(f'psm_{config.split()[1]}_timeout')

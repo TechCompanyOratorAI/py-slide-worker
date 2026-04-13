@@ -250,8 +250,13 @@ class PDFTextExtractor:
                 for future in as_completed(future_to_page):
                     pn = future_to_page[future]
                     try:
-                        page_num, text = future.result()
+                        # 35s hard timeout to guarantee it never blocks the worker infinitely
+                        # (20s max for pytesseract inside + 15s padding/startup overhead)
+                        page_num, text = future.result(timeout=35)
                         results[page_num] = text
+                    except TimeoutError:
+                        logger.error(f"OCR page {pn} strictly timed out after 35s from future")
+                        results[pn] = ''
                     except Exception as e:
                         logger.error(f"OCR page {pn} worker error: {e}")
                         results[pn] = ''
