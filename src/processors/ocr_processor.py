@@ -232,11 +232,18 @@ class OCRProcessor:
                 # Open image
                 image = Image.open(enhanced_path if enhanced_path != image_path else image_path)
 
-                # Try different PSM modes for better results with timeout
+                # PSM modes ordered best-to-worst for typical slide content.
+                # psm 6: uniform block (most slides)
+                # psm 4: single-column (common in reports/presentations)
+                # psm 3: fully automatic (fallback)
+                # psm 11: sparse text (last resort for scattered content)
+                # Sequential execution on 1 vCPU: Tesseract gets full CPU per attempt.
+                # 90s timeout is generous but realistic for dense/complex pages.
                 configs = [
-                    f'--psm 6 -l {OCR_LANGUAGE}',  # Uniform block of text
-                    f'--psm 11 -l {OCR_LANGUAGE}',  # Sparse text
+                    f'--psm 6 -l {OCR_LANGUAGE}',   # Uniform block of text
+                    f'--psm 4 -l {OCR_LANGUAGE}',   # Single column (good for slides)
                     f'--psm 3 -l {OCR_LANGUAGE}',   # Fully automatic page seg
+                    f'--psm 11 -l {OCR_LANGUAGE}',  # Sparse text (last resort)
                 ]
 
                 best_text = None
@@ -248,19 +255,17 @@ class OCRProcessor:
                             logger.warning(f"Skipping OCR config {i+1} due to low memory")
                             break
 
-                        # -------------------------------------------------------
-                        # Strict subprocess timeout mapping to PyTesseract
-                        # -------------------------------------------------------
-                        # pytesseract's timeout enforces subprocess-level kill.
-                        # Pass timeout=20 directly to pytesseract so it kills the C++ process
-                        text = pytesseract.image_to_string(image, config=config, timeout=20)
+                        # 90s timeout: kills the Tesseract C++ subprocess if stuck.
+                        # On 1 vCPU sequential mode, Tesseract gets full CPU so most
+                        # complex pages finish well within this budget.
+                        text = pytesseract.image_to_string(image, config=config, timeout=90)
                         text = ' '.join(text.split())
 
                         if text.strip() and (best_text is None or len(text) > len(best_text)):
                             best_text = text
 
-                        # Early exit if result is good enough
-                        if best_text and len(best_text) >= 100:
+                        # Early exit only when result is very good (be thorough in sequential mode)
+                        if best_text and len(best_text) >= 300:
                             break
 
                     except RuntimeError as e:

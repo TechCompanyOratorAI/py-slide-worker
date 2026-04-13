@@ -197,14 +197,12 @@ class PDFTextExtractor:
         
         try:
             from pdf2image import convert_from_path
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-            from config.memory_config import PAGE_WORKERS
 
             page_numbers = [p['pageNumber'] for p in ocr_pages]
-            logger.info(f"OCR fallback: {len(page_numbers)} pages, PAGE_WORKERS={PAGE_WORKERS}")
+            logger.info(f"OCR fallback: {len(page_numbers)} pages (sequential, 1 vCPU mode)")
 
-            def _process_one_page(page_num: int):
-                """Convert one PDF page to image and OCR it. Returns (page_num, text)."""
+            results: Dict[int, str] = {}
+            for page_num in page_numbers:
                 temp_img_path = None
                 try:
                     images = convert_from_path(
@@ -216,7 +214,8 @@ class PDFTextExtractor:
                     )
                     if not images:
                         logger.warning(f"No image generated for page {page_num}")
-                        return page_num, ''
+                        results[page_num] = ''
+                        continue
 
                     temp_img_path = pdf_path.replace('.pdf', f'_ocr_page_{page_num}.png')
                     images[0].save(temp_img_path, 'PNG', quality=85, optimize=True)
@@ -224,12 +223,13 @@ class PDFTextExtractor:
                     optimize_memory()
 
                     text = self.ocr_processor.extract_text_from_image(temp_img_path)
-                    logger.info(f"OCR page {page_num}: {len(text or '')} chars")
-                    return page_num, text or ''
+                    char_count = len(text or '')
+                    logger.info(f"OCR page {page_num}: {char_count} chars")
+                    results[page_num] = text or ''
 
                 except Exception as e:
                     logger.error(f"OCR page {page_num} failed: {e}")
-                    return page_num, ''
+                    results[page_num] = ''
                 finally:
                     if temp_img_path:
                         try:
@@ -241,25 +241,6 @@ class PDFTextExtractor:
                                 os.remove(enhanced)
                         except Exception:
                             pass
-
-            # Process pages concurrently; semaphore in extract_text_from_image
-            # ensures total concurrent OCR ≤ MAX_CONCURRENT_OCR across all threads
-            results: Dict[int, str] = {}
-            with ThreadPoolExecutor(max_workers=PAGE_WORKERS) as executor:
-                future_to_page = {executor.submit(_process_one_page, pn): pn for pn in page_numbers}
-                for future in as_completed(future_to_page):
-                    pn = future_to_page[future]
-                    try:
-                        # 35s hard timeout to guarantee it never blocks the worker infinitely
-                        # (20s max for pytesseract inside + 15s padding/startup overhead)
-                        page_num, text = future.result(timeout=35)
-                        results[page_num] = text
-                    except TimeoutError:
-                        logger.error(f"OCR page {pn} strictly timed out after 35s from future")
-                        results[pn] = ''
-                    except Exception as e:
-                        logger.error(f"OCR page {pn} worker error: {e}")
-                        results[pn] = ''
 
             # Return in original page order — critical for correct PDF structure
             return [{'pageNumber': pn, 'text': results.get(pn, '')} for pn in page_numbers]
