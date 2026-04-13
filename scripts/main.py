@@ -28,8 +28,9 @@ from config.memory_config import (
 from src.clients.aws_client import get_aws_client
 from src.handlers.message_handler import get_message_handler
 
-# Number of concurrent worker threads (tune based on RAM: ~300MB per worker)
-WORKER_THREADS = int(os.getenv('WORKER_THREADS', '3'))
+# 1 job at a time: on 1 shared vCPU, parallelism hurts more than it helps.
+# Tesseract gets the full CPU budget and finishes faster + more accurately.
+WORKER_THREADS = int(os.getenv('WORKER_THREADS', '1'))
 
 logger = logging.getLogger(__name__)
 
@@ -103,11 +104,10 @@ def poll_queue():
                     time.sleep(0.1)
                     continue
 
-                # --- Memory guard: ~400MB headroom per job ---
-                # Actual observed peak: ~350-400MB per concurrent job
-                # (OCR DPI=200 page image + tesseract workspace + PDF decode).
-                # Setting 400MB avoids false positives that cause unnecessary blocking.
-                MEMORY_PER_JOB_MB = 400
+                # --- Memory guard: 1 job at a time, generous headroom ---
+                # With WORKER_THREADS=1 we only ever run 1 job concurrently.
+                # Give it 600MB headroom so it never gets throttled.
+                MEMORY_PER_JOB_MB = 600
                 headroom_mb = get_available_memory_mb()
                 affordable = min(available, max(0, int(headroom_mb // MEMORY_PER_JOB_MB)))
                 if affordable == 0:

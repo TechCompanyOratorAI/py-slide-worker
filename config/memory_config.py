@@ -23,13 +23,12 @@ MEMORY_LIMIT_MB = 1600  # 1600MB memory limit (80% of 2GB)
 MEMORY_WARNING_MB = 1100  # Warning threshold at 1100MB (was 1200) — trigger GC earlier
 
 # Intra-job page parallelism
-# PAGE_WORKERS: concurrent pages/slides within ONE job
-PAGE_WORKERS = int(os.getenv('PAGE_WORKERS', '2'))
+# PAGE_WORKERS=1: sequential page processing — optimal for 1 shared vCPU.
+# Multiple threads on 1 vCPU cause context switching that slows Tesseract.
+PAGE_WORKERS = int(os.getenv('PAGE_WORKERS', '1'))
 
-# Global semaphore caps total concurrent OCR operations across ALL threads
-# Budget: (MEMORY_LIMIT_MB - base_461MB) / ~250MB_per_ocr ≈ 4-5
-# Keep at 4 to leave headroom for GC fragmentation
-MAX_CONCURRENT_OCR = int(os.getenv('MAX_CONCURRENT_OCR', '4'))
+# Only 1 OCR at a time (matches PAGE_WORKERS=1 + WORKER_THREADS=1)
+MAX_CONCURRENT_OCR = int(os.getenv('MAX_CONCURRENT_OCR', '1'))
 _ocr_semaphore = threading.Semaphore(MAX_CONCURRENT_OCR)
 
 def optimize_memory():
