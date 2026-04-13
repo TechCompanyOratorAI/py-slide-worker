@@ -103,10 +103,11 @@ def poll_queue():
                     time.sleep(0.1)
                     continue
 
-                # --- Memory guard: ~300MB headroom per job ---
-                # Calculate how many jobs we can actually afford right now
-                # instead of blocking if we can't afford ALL available slots.
-                MEMORY_PER_JOB_MB = 300
+                # --- Memory guard: ~400MB headroom per job ---
+                # Actual observed peak: ~350-400MB per concurrent job
+                # (OCR DPI=200 page image + tesseract workspace + PDF decode).
+                # Setting 400MB avoids false positives that cause unnecessary blocking.
+                MEMORY_PER_JOB_MB = 400
                 headroom_mb = get_available_memory_mb()
                 affordable = min(available, max(0, int(headroom_mb // MEMORY_PER_JOB_MB)))
                 if affordable == 0:

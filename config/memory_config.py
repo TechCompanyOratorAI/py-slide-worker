@@ -17,9 +17,10 @@ logger = logging.getLogger(__name__)
 # Memory limits for 2GB RAM instance
 MAX_PDF_PAGES = 50  # Increased from 30 with more RAM headroom
 MAX_IMAGE_SIZE = 20971520  # 20MB max image size (doubled from 10MB)
-DPI_SETTING = 300  # DPI for OCR processing (300 is optimal for tesseract accuracy)
+DPI_SETTING = 200  # DPI for OCR (200 is sufficient for slide content with large fonts;
+                   # reduces memory per page ~55% vs 300 DPI)
 MEMORY_LIMIT_MB = 1600  # 1600MB memory limit (80% of 2GB)
-MEMORY_WARNING_MB = 1200  # Warning threshold at 1200MB
+MEMORY_WARNING_MB = 1100  # Warning threshold at 1100MB (was 1200) — trigger GC earlier
 
 # Intra-job page parallelism
 # PAGE_WORKERS: concurrent pages/slides within ONE job
