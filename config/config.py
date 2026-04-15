@@ -27,7 +27,7 @@ WEBHOOK_URL = os.getenv('WEBHOOK_URL', 'http://localhost:8080/api/v1/webhooks/sl
 WEBHOOK_SECRET = os.getenv('WEBHOOK_SECRET')
 
 # OCR Configuration
-OCR_LANGUAGE = os.getenv('OCR_LANGUAGE', 'vie+eng')
+OCR_LANGUAGE = os.getenv('OCR_LANGUAGE', 'vi,en')
 
 # Check required environment variables
 def validate_config():
@@ -58,18 +58,19 @@ def check_library_availability():
         'EASYOCR_AVAILABLE': False,
         'PYMUPDF_AVAILABLE': False,
         'PDFPLUMBER_AVAILABLE': False,
-        'PPTX_AVAILABLE': False
+        'PPTX_AVAILABLE': False,
     }
     
     logger = logging.getLogger(__name__)
     
     # Check OCR libraries
     try:
-        import pytesseract
+        import easyocr
         from PIL import Image, ImageEnhance, ImageFilter
         availability['OCR_AVAILABLE'] = True
+        availability['EASYOCR_AVAILABLE'] = True
     except ImportError:
-        logger.warning("⚠️ pytesseract or Pillow not installed. OCR will not work.")
+        logger.warning("⚠️ easyocr or Pillow not installed. OCR will not work.")
     
     try:
         from pdf2image import convert_from_path, convert_from_bytes
@@ -83,12 +84,6 @@ def check_library_availability():
         availability['CV2_AVAILABLE'] = True
     except ImportError:
         logger.warning("⚠️ opencv-python not installed. Image enhancement will be limited.")
-    
-    try:
-        import easyocr
-        availability['EASYOCR_AVAILABLE'] = True
-    except ImportError:
-        logger.info("ℹ️ easyocr not installed. Will use pytesseract only.")
     
     try:
         import fitz  # PyMuPDF

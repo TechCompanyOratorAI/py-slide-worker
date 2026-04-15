@@ -1,92 +1,25 @@
 """
 OCR processing module for py-analysis-worker
-Handles text extraction from images and PDFs using pytesseract and easyocr
+Handles text extraction from images and PDFs using easyocr
 """
 
 import os
 import logging
-import signal
 import threading
-import time
 from typing import Optional, List, Dict
 from config.config import OCR_LANGUAGE, check_library_availability
 from config.memory_config import check_memory_usage, is_memory_available, optimize_memory, MAX_IMAGE_SIZE, _ocr_semaphore
 
 logger = logging.getLogger(__name__)
 
-# Auto-detect and set TESSDATA_PREFIX if not already configured
-def _setup_tessdata_prefix():
-    """
-    Detect the correct tessdata directory and set TESSDATA_PREFIX.
-
-    Search order:
-      1. Explicit env var (skip if already set)
-      2. DigitalOcean buildpack path  (/layers/digitalocean_apt/apt/...)
-      3. Standard distro paths
-      4. Glob scan for any installed tesseract version (4.00, 4.1, 5.x, etc.)
-    """
-    if os.environ.get('TESSDATA_PREFIX'):
-        existing = os.environ['TESSDATA_PREFIX']
-        logger.info(f"TESSDATA_PREFIX already set: {existing}")
-        return
-
-    import glob
-
-    candidate_dirs = [
-        # DigitalOcean buildpack apt layer (highest priority — confirmed working)
-        '/layers/digitalocean_apt/apt/usr/share/tesseract-ocr/4.00/tessdata',
-        '/layers/digitalocean_apt/apt/usr/share/tesseract-ocr/5.00/tessdata',
-        # Standard paths with exact version
-        '/usr/share/tesseract-ocr/4.00/tessdata',
-        '/usr/share/tesseract-ocr/5.00/tessdata',
-        '/usr/share/tesseract-ocr/5/tessdata',
-        '/usr/share/tesseract-ocr/4/tessdata',
-        '/usr/share/tessdata',
-        '/usr/local/share/tessdata',
-        '/opt/homebrew/share/tessdata',
-    ]
-
-    # Append glob-discovered paths (catches any installed version: 4.1, 5.3, etc.)
-    for pattern in [
-        '/layers/digitalocean_apt/apt/usr/share/tesseract-ocr/*/tessdata',
-        '/usr/share/tesseract-ocr/*/tessdata',
-        '/usr/local/share/tesseract-ocr/*/tessdata',
-    ]:
-        for discovered in sorted(glob.glob(pattern), reverse=True):  # newest first
-            if discovered not in candidate_dirs:
-                candidate_dirs.append(discovered)
-
-    for path in candidate_dirs:
-        try:
-            if not os.path.isdir(path):
-                continue
-            traineddata_files = [f for f in os.listdir(path) if f.endswith('.traineddata')]
-            if traineddata_files:
-                os.environ['TESSDATA_PREFIX'] = path
-                langs = [f.replace('.traineddata', '') for f in traineddata_files[:5]]
-                logger.info(
-                    f"Auto-detected TESSDATA_PREFIX: {path} "
-                    f"(languages: {langs}{'...' if len(traineddata_files) > 5 else ''})"
-                )
-                return
-        except Exception as e:
-            logger.debug(f"Skipping tessdata candidate {path}: {e}")
-
-    logger.error(
-        "❌ Could not auto-detect tessdata directory. "
-        "Set TESSDATA_PREFIX environment variable manually. "
-        "Run: find / -name 'eng.traineddata' 2>/dev/null"
-    )
-
-_setup_tessdata_prefix()
-
 # Check library availability
 LIBS = check_library_availability()
 
 # Import libraries if available
 if LIBS['OCR_AVAILABLE']:
-    import pytesseract
-    from PIL import Image, ImageEnhance, ImageFilter
+    from PIL import Image
+    if LIBS.get('EASYOCR_AVAILABLE'):
+        import easyocr
 
 if LIBS['PDF2IMAGE_AVAILABLE']:
     from pdf2image import convert_from_path, convert_from_bytes
@@ -95,44 +28,50 @@ if LIBS['CV2_AVAILABLE']:
     import cv2
     import numpy as np
 
-# Commented out EasyOCR for lighter deployment
-# if LIBS['EASYOCR_AVAILABLE']:
-#     import easyocr
-
 class OCRProcessor:
-    """OCR processor for extracting text from images and PDFs"""
+    """OCR processor for extracting text from images and PDFs using EasyOCR"""
     
     def __init__(self):
         """Initialize OCR processor"""
         self.easyocr_reader = None
         
-        # Skip EasyOCR for lighter deployment - use only pytesseract
-        # if LIBS['EASYOCR_AVAILABLE']:
-        #     try:
-        #         # Initialize with Vietnamese and English
-        #         self.easyocr_reader = easyocr.Reader(['vi', 'en'], gpu=False)
-        #         logger.info("✅ EasyOCR initialized (Vietnamese + English)")
-        #     except Exception as e:
-        #         logger.warning(f"⚠️ Failed to initialize EasyOCR: {e}. Will use pytesseract.")
-        #         self.easyocr_reader = None
-        
+        if LIBS.get('EASYOCR_AVAILABLE'):
+            try:
+                # Handle old Tesseract format from .env (e.g. 'vie+eng')
+                # Translate 'vie' -> 'vi' and 'eng' -> 'en'
+                langs_str = OCR_LANGUAGE.replace('+', ',').replace('vie', 'vi').replace('eng', 'en')
+                
+                langs = [lang.strip() for lang in langs_str.split(',') if lang.strip()]
+                if not langs:
+                    langs = ['vi', 'en']
+                    
+                # Initialize with languages and gpu=False to save RAM on standard instances
+                logger.info(f"Loading EasyOCR model for languages: {langs}...")
+                self.easyocr_reader = easyocr.Reader(langs, gpu=False)
+                logger.info("✅ EasyOCR initialized successfully")
+            except Exception as e:
+                logger.error(f"⚠️ Failed to initialize EasyOCR: {e}")
+                self.easyocr_reader = None
+        else:
+            logger.error("EasyOCR library is not available.")
+            
         logger.info("OCR processor initialized")
-    
+
     def enhance_image(self, image_path: str) -> Optional[str]:
         """
-        Enhance image quality for better OCR results
+        Enhance image quality for better OCR results.
+        Uses bilateral filtering which works well for EasyOCR.
         
         Args:
             image_path: Path to original image
             
         Returns:
-            Path to enhanced image or None if failed
+            Path to enhanced image or original if failed
         """
         if not LIBS['CV2_AVAILABLE']:
-            return image_path  # Return original if cv2 not available
+            return image_path
         
         try:
-            # Read image
             img = cv2.imread(image_path)
             if img is None:
                 return image_path
@@ -140,27 +79,24 @@ class OCRProcessor:
             # Convert to grayscale
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-            # Detect dark-background slides (white text on dark bg) and invert
-            # so text is always dark on light background before thresholding
+            # Invert dark-background slides for better thresholding
             if gray.mean() < 128:
                 gray = cv2.bitwise_not(gray)
 
-            # Apply denoising
-            denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
+            # Apply bilateral filter to remove noise while keeping edges sharp
+            denoised = cv2.bilateralFilter(gray, 9, 75, 75)
 
-            # Increase contrast using CLAHE (Contrast Limited Adaptive Histogram Equalization)
+            # Contrast enhancement
             clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
             enhanced = clahe.apply(denoised)
 
-            # Apply threshold to get binary image
+            # Binarization
             _, binary = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-            # Save enhanced image (fix: use splitext to handle filenames with multiple dots)
             base, ext = os.path.splitext(image_path)
             enhanced_path = f"{base}_enhanced{ext}"
             cv2.imwrite(enhanced_path, binary)
             
-            logger.debug(f"Enhanced image saved: {enhanced_path}")
             return enhanced_path
             
         except Exception as e:
@@ -169,139 +105,75 @@ class OCRProcessor:
     
     def extract_text_from_image(self, image_path: str) -> Optional[str]:
         """
-        Extract text from single image using OCR with memory management
-        
+        Extract text from a single image using EasyOCR.
+
         Args:
-            image_path: Path to image file
-            
+            image_path: Path to image file.
+
         Returns:
-            Extracted text or None if failed
+            Extracted text string, or None if failed.
         """
-        if not LIBS['OCR_AVAILABLE']:
-            logger.error("OCR libraries not available. Please install pytesseract and Pillow.")
+        if not self.easyocr_reader:
+            logger.error("EasyOCR reader is not initialized.")
             return None
-        
+
         # Check file size
         try:
             file_size = os.path.getsize(image_path)
             if file_size > MAX_IMAGE_SIZE:
-                logger.error(f"Image too large: {file_size} bytes > {MAX_IMAGE_SIZE} bytes limit")
+                logger.error(f"Image too large: {file_size} bytes limit")
                 return None
         except Exception as e:
             logger.warning(f"Could not check file size: {e}")
-        
-        # Check memory before processing (reduced requirement)
-        if not is_memory_available(100):  # Reduced to 100MB for OCR
-            logger.error("Insufficient memory for OCR processing")
+
+        # Check memory (Require 300MB headroom for EasyOCR processing over loaded model)
+        if not is_memory_available(300):
+            logger.error("Insufficient memory for EasyOCR processing")
             return None
 
-        # Semaphore caps total concurrent OCR across all threads/jobs
-        # preventing OOM when intra-job and inter-job parallelism overlap
         with _ocr_semaphore:
             try:
-                # Monitor memory during processing
                 check_memory_usage()
-                # Enhance image for better OCR
+                logger.info(f"[EASYOCR] Processing image: {image_path}")
+                
                 enhanced_path = self.enhance_image(image_path)
+                target_img = enhanced_path if enhanced_path != image_path else image_path
+                
+                # Diagnostic log before OCR processing
+                try:
+                    import psutil
+                    mem_before = psutil.Process().memory_info().rss / 1024 / 1024
+                    logger.info(f"[DIAGNOSTIC] RAM before decode: {mem_before:.1f} MB")
+                except ImportError:
+                    mem_before = 0
+                
+                results = self.easyocr_reader.readtext(target_img)
 
-                # Try EasyOCR first (better for Vietnamese)
-                if self.easyocr_reader:
-                    try:
-                        logger.info(f"Using EasyOCR for: {image_path}")
-                        results = self.easyocr_reader.readtext(enhanced_path if enhanced_path != image_path else image_path)
+                # Diagnostic log after OCR processing
+                try:
+                    import psutil
+                    mem_after = psutil.Process().memory_info().rss / 1024 / 1024
+                    delta = mem_after - mem_before if mem_before > 0 else 0
+                    logger.info(f"[DIAGNOSTIC] RAM after decode: {mem_after:.1f} MB (Delta: {delta:+.1f} MB)")
+                except ImportError:
+                    pass
 
-                        # Combine all detected text
-                        text_parts = []
-                        for (bbox, text, confidence) in results:
-                            if confidence > 0.5:  # Filter low confidence results
-                                text_parts.append(text)
+                text_parts = []
+                for (bbox, text, confidence) in results:
+                    if confidence > 0.4:  # Adjust threshold if needed
+                        text_parts.append(text)
 
-                        text = '\n'.join(text_parts)
+                combined_text = '\n'.join(text_parts).strip()
 
-                        if text.strip():
-                            logger.info(f"EasyOCR extracted {len(text)} characters (confidence filtered)")
-                            return text.strip()
-                        else:
-                            logger.warning("EasyOCR returned empty text, falling back to pytesseract")
-                    except Exception as e:
-                        logger.warning(f"EasyOCR failed: {e}. Falling back to pytesseract.")
-
-                # Fallback to pytesseract
-                logger.info(f"Using pytesseract for: {image_path}")
-
-                # Open image
-                image = Image.open(enhanced_path if enhanced_path != image_path else image_path)
-
-                # PSM modes ordered best-to-worst for typical slide content.
-                # psm 6: uniform block (most slides)
-                # psm 4: single-column (common in reports/presentations)
-                # psm 3: fully automatic (fallback)
-                # psm 11: sparse text (last resort for scattered content)
-                # Sequential execution on 1 vCPU: Tesseract gets full CPU per attempt.
-                # 90s timeout is generous but realistic for dense/complex pages.
-                configs = [
-                    f'--psm 6 -l {OCR_LANGUAGE}',   # Uniform block of text
-                    f'--psm 4 -l {OCR_LANGUAGE}',   # Single column (good for slides)
-                    f'--psm 3 -l {OCR_LANGUAGE}',   # Fully automatic page seg
-                    f'--psm 11 -l {OCR_LANGUAGE}',  # Sparse text (last resort)
-                ]
-
-                best_text = None
-                failed_configs = []
-                for i, config in enumerate(configs):
-                    try:
-                        # Check memory before each attempt
-                        if not is_memory_available(30):
-                            logger.warning(f"Skipping OCR config {i+1} due to low memory")
-                            break
-
-                        # 90s timeout: kills the Tesseract C++ subprocess if stuck.
-                        # On 1 vCPU sequential mode, Tesseract gets full CPU so most
-                        # complex pages finish well within this budget.
-                        text = pytesseract.image_to_string(image, config=config, timeout=90)
-                        text = ' '.join(text.split())
-
-                        if text.strip() and (best_text is None or len(text) > len(best_text)):
-                            best_text = text
-
-                        # Early exit only when result is very good (be thorough in sequential mode)
-                        if best_text and len(best_text) >= 300:
-                            break
-
-                    except RuntimeError as e:
-                        if 'timeout' in str(e).lower():
-                            logger.debug(f"OCR config {i+1} timed out (via RuntimeError)")
-                            failed_configs.append(f'psm_{config.split()[1]}_timeout')
-                            continue
-                        raise
-                    except TimeoutError:
-                        logger.debug(f"OCR config {i+1} timed out")
-                        failed_configs.append(f'psm_{config.split()[1]}_timeout')
-                        continue
-                    except Exception as e:
-                        # Collect failures silently; log once at the end
-                        failed_configs.append(f'psm_{config.split()[1]}')
-                        logger.debug(f"OCR config {i+1} failed: {e}")
-                        continue
-                    finally:
-                        optimize_memory()
-
-                # Log all failures in one message instead of per-config spam
-                if failed_configs:
-                    logger.warning(
-                        f"OCR configs failed for {image_path}: {failed_configs}. "
-                        f"Check TESSDATA_PREFIX={os.environ.get('TESSDATA_PREFIX', 'NOT SET')}"
-                    )
-
-                if best_text and best_text.strip():
-                    logger.info(f"Pytesseract extracted {len(best_text)} characters")
-                    return best_text.strip()
-                else:
-                    logger.warning("Pytesseract returned empty text")
-                    return None
+                if combined_text:
+                    logger.info(f"[EASYOCR] Extracted {len(combined_text)} chars")
+                    return combined_text
+                    
+                logger.warning(f"[EASYOCR] No text extracted from '{image_path}'")
+                return None
 
             except MemoryError as e:
-                logger.error(f"OCR failed due to memory exhaustion for {image_path}: {e}")
+                logger.error(f"OCR failed due to memory exhaustion: {e}")
                 optimize_memory()
                 return None
             except Exception as e:
