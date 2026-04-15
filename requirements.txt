@@ -21,8 +21,8 @@ PyMuPDF>=1.23.0,<2.0.0
 pdfplumber>=0.10.0,<1.0.0
 pdf2image>=1.16.3,<2.0.0
 
-# OCR - only pytesseract (lighter than easyocr)
-pytesseract>=0.3.10,<1.0.0
+# OCR - EasyOCR (requires PyTorch)
+easyocr>=1.7.0,<2.0.0
 
 # Basic image processing (headless version for containers)
 opencv-python-headless>=4.8.0,<5.0.0
@@ -36,3 +36,4 @@ scikit-learn>=1.3.0,<2.0.0
 
 # Logging and utilities
 python-dateutil>=2.8.0,<3.0.0
+
