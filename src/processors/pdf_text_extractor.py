@@ -6,7 +6,7 @@ Optimized for slide alignment and memory efficiency
 import os
 import logging
 from typing import List, Dict, Optional, Tuple
-from config.config import check_library_availability, POPPLER_PATH
+from config.config import check_library_availability
 from config.memory_config import check_memory_usage, is_memory_available, optimize_memory, DPI_SETTING
 
 logger = logging.getLogger(__name__)
@@ -195,32 +195,32 @@ class PDFTextExtractor:
             logger.warning("No OCR processor available for fallback")
             return []
         
+        if not LIBS.get('PYMUPDF_AVAILABLE', False):
+            logger.error("PyMuPDF not available — cannot render pages for OCR fallback")
+            return []
+
+        page_numbers = [p['pageNumber'] for p in ocr_pages]
+        logger.info(f"OCR fallback: {len(page_numbers)} pages (sequential, 1 vCPU mode)")
+
+        matrix = fitz.Matrix(DPI_SETTING / 72, DPI_SETTING / 72)
+        results: Dict[int, str] = {}
+
         try:
-            from pdf2image import convert_from_path
+            doc = fitz.open(pdf_path)
+        except Exception as e:
+            logger.error(f"OCR fallback: failed to open PDF: {e}")
+            return []
 
-            page_numbers = [p['pageNumber'] for p in ocr_pages]
-            logger.info(f"OCR fallback: {len(page_numbers)} pages (sequential, 1 vCPU mode)")
-
-            results: Dict[int, str] = {}
+        try:
             for page_num in page_numbers:
                 temp_img_path = None
                 try:
-                    images = convert_from_path(
-                        pdf_path,
-                        dpi=DPI_SETTING,
-                        fmt='png',
-                        first_page=page_num,
-                        last_page=page_num,
-                        poppler_path=POPPLER_PATH
-                    )
-                    if not images:
-                        logger.warning(f"No image generated for page {page_num}")
-                        results[page_num] = ''
-                        continue
+                    page = doc[page_num - 1]
+                    pixmap = page.get_pixmap(matrix=matrix, alpha=False)
 
                     temp_img_path = pdf_path.replace('.pdf', f'_ocr_page_{page_num}.png')
-                    images[0].save(temp_img_path, 'PNG', quality=85, optimize=True)
-                    del images
+                    pixmap.save(temp_img_path)
+                    del pixmap
                     optimize_memory()
 
                     text = self.ocr_processor.extract_text_from_image(temp_img_path)
@@ -242,13 +242,11 @@ class PDFTextExtractor:
                                 os.remove(enhanced)
                         except Exception:
                             pass
+        finally:
+            doc.close()
 
-            # Return in original page order — critical for correct PDF structure
-            return [{'pageNumber': pn, 'text': results.get(pn, '')} for pn in page_numbers]
-
-        except Exception as e:
-            logger.error(f"OCR fallback failed: {e}")
-            return []
+        # Return in original page order — critical for correct PDF structure
+        return [{'pageNumber': pn, 'text': results.get(pn, '')} for pn in page_numbers]
 
 # Global PDF text extractor instance + lock for thread-safe initialisation
 import threading as _threading
