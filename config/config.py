@@ -28,6 +28,7 @@ WEBHOOK_SECRET = os.getenv('WEBHOOK_SECRET')
 
 # OCR Configuration
 OCR_LANGUAGE = os.getenv('OCR_LANGUAGE', 'vi,en')
+POPPLER_PATH = os.getenv('POPPLER_PATH', None)  # Required on Windows; e.g. C:\poppler\Library\bin
 
 # Check required environment variables
 def validate_config():

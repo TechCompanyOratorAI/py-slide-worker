@@ -6,7 +6,7 @@ Optimized for slide alignment and memory efficiency
 import os
 import logging
 from typing import List, Dict, Optional, Tuple
-from config.config import check_library_availability
+from config.config import check_library_availability, POPPLER_PATH
 from config.memory_config import check_memory_usage, is_memory_available, optimize_memory, DPI_SETTING
 
 logger = logging.getLogger(__name__)
@@ -210,7 +210,8 @@ class PDFTextExtractor:
                         dpi=DPI_SETTING,
                         fmt='png',
                         first_page=page_num,
-                        last_page=page_num
+                        last_page=page_num,
+                        poppler_path=POPPLER_PATH
                     )
                     if not images:
                         logger.warning(f"No image generated for page {page_num}")
