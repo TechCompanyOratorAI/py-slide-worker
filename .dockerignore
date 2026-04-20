@@ -1,0 +1,7 @@
+.git
+.github
+__pycache__
+venv
+.env
+.DS_Store
+gcp-vision-key.json

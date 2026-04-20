@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  slide-worker:
+    build: .
+    container_name: py-slide-worker
+    env_file:
+      - .env
+    # To include gcp-vision-key.json, you might need to map it via volumes if you excluded it in .dockerignore but want to use it locally.
+    volumes:
+      - .:/app
+      - ./gcp-vision-key.json:/app/gcp-vision-key.json:ro
+    restart: unless-stopped
+    command: python worker.py
